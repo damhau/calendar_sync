@@ -98,6 +98,7 @@ class AccountConfig:
         self.required_cookies: list[str] = data.get("required_cookies", ["MRHSession"])
         self.prefix: str = data.get("prefix", "")
         self.category: Optional[str] = data.get("category")
+        self.color: str = data.get("color", "blue")
         self.auth_method: str = data.get("auth_method", "selenium" if self.type == "ews_selenium" else "oauth")
 
 

@@ -249,6 +249,12 @@ def main() -> int:
                 logger.error(f"Writing to {target_account.type} not supported")
                 return 1
 
+            # Ensure categories exist with correct colors
+            for name in source_names:
+                account = sync_config.accounts[name]
+                if account.category:
+                    target_writer.ensure_category(account.category, account.color)
+
             # Fetch existing events for dedup
             existing = target_writer.get_existing_events(start, end)
 

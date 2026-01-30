@@ -16,12 +16,44 @@ logger = logging.getLogger(__name__)
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 
+# M365 preset color names -> API values
+# See https://learn.microsoft.com/en-us/graph/api/resources/outlookcategory
+CATEGORY_COLORS = {
+    "red": "preset0",
+    "orange": "preset1",
+    "brown": "preset2",
+    "yellow": "preset3",
+    "green": "preset4",
+    "teal": "preset5",
+    "olive": "preset6",
+    "blue": "preset7",
+    "purple": "preset8",
+    "cranberry": "preset9",
+    "steel": "preset10",
+    "darksteel": "preset11",
+    "gray": "preset12",
+    "darkgray": "preset13",
+    "black": "preset14",
+    "darkred": "preset15",
+    "darkorange": "preset16",
+    "darkyellow": "preset17",
+    "darkgreen": "preset18",
+    "darkteal": "preset19",
+    "darkolive": "preset20",
+    "darkblue": "preset21",
+    "darkpurple": "preset22",
+    "darkcranberry": "preset23",
+    "none": "none",
+}
+
+
 class M365CalendarWriter(CalendarWriter):
     """Write events to Microsoft 365 using Graph API."""
 
     def __init__(self, auth_provider: M365AuthProvider):
         self.auth_provider = auth_provider
         self._existing_events: Optional[dict[str, str]] = None
+        self._ensured_categories: set[str] = set()
 
     def _headers(self) -> dict[str, str]:
         token = self.auth_provider.get_access_token()
@@ -29,6 +61,36 @@ class M365CalendarWriter(CalendarWriter):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+
+    def ensure_category(self, name: str, color: str = "blue") -> None:
+        """Ensure an Outlook category exists with the given color."""
+        if name in self._ensured_categories:
+            return
+
+        preset = CATEGORY_COLORS.get(color.lower(), color)
+        # Check if category already exists
+        url = f"{GRAPH_BASE}/me/outlook/masterCategories"
+        resp = requests.get(url, headers=self._headers())
+        resp.raise_for_status()
+        existing = {cat["displayName"]: cat for cat in resp.json().get("value", [])}
+
+        if name in existing:
+            # Update color if different
+            cat = existing[name]
+            if cat.get("color") != preset:
+                patch_url = f"{url}/{cat['id']}"
+                requests.patch(patch_url, headers=self._headers(), json={"color": preset})
+                logger.info(f"Updated category '{name}' color to {color}")
+        else:
+            # Create new category
+            resp = requests.post(url, headers=self._headers(), json={
+                "displayName": name,
+                "color": preset,
+            })
+            resp.raise_for_status()
+            logger.info(f"Created category '{name}' with color {color}")
+
+        self._ensured_categories.add(name)
 
     def get_existing_events(
         self, start: datetime, end: datetime, calendar_id: Optional[str] = None
