@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 
 from ..utils.exceptions import AuthenticationError
@@ -28,6 +28,7 @@ class SeleniumEWSAuth:
         base_url: str,
         cookie_file: Path,
         required_cookies: Optional[list[str]] = None,
+        browser: str = "chrome",
     ):
         """
         Initialize Selenium-based EWS authentication.
@@ -36,10 +37,12 @@ class SeleniumEWSAuth:
             base_url: Base URL of the Exchange server (e.g., https://mail.ext.icrc.org)
             cookie_file: Path to store/load cookies
             required_cookies: List of required cookie names (e.g., ['MRHSession', 'FedAuth'])
+            browser: Browser to use ('chrome' or 'edge')
         """
         self.base_url = base_url.rstrip("/")
         self.cookie_file = cookie_file
         self.required_cookies = required_cookies or ["MRHSession"]
+        self.browser = browser.lower()
         self._cookies: Optional[dict[str, str]] = None
 
     def load_cookies(self) -> Optional[dict[str, str]]:
@@ -94,7 +97,7 @@ class SeleniumEWSAuth:
 
     def fetch_cookies_from_browser(self) -> dict[str, str]:
         """
-        Open Chrome and wait for user to login, then extract cookies.
+        Open browser and wait for user to login, then extract cookies.
 
         Returns:
             Dictionary of cookies
@@ -102,19 +105,35 @@ class SeleniumEWSAuth:
         Raises:
             AuthenticationError: If browser automation fails or cookies not found
         """
-        print("🌐 Opening Chrome to let you log in...")
+        browser_name = self.browser.capitalize()
+        print(f"🌐 Opening {browser_name} to let you log in...")
 
-        options = Options()
-        options.add_experimental_option("detach", False)
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--remote-debugging-port=9222")
-
-        # Let Selenium automatically manage the driver
-        driver = webdriver.Chrome(options=options)
+        # Create browser-specific options and driver
+        if self.browser == "edge":
+            try:
+                from selenium.webdriver.edge.options import Options
+                options = Options()
+                options.add_experimental_option("detach", False)
+                options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                options.add_experimental_option("useAutomationExtension", False)
+                options.add_argument("--disable-blink-features=AutomationControlled")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                driver = webdriver.Edge(options=options)
+            except ImportError:
+                raise AuthenticationError(
+                    "Edge WebDriver not available. Install with: pip install selenium[edge]"
+                )
+        else:  # chrome
+            options = ChromeOptions()
+            options.add_experimental_option("detach", False)
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--remote-debugging-port=9222")
+            driver = webdriver.Chrome(options=options)
         # options = Options()
         # options.add_experimental_option("detach", False)
         # driver = webdriver.Chrome(options=options)
@@ -130,20 +149,71 @@ class SeleniumEWSAuth:
             )
 
             print(f"✅ Loaded: {driver.current_url}")
-            print("🕐 Please log in manually. Waiting for cookies...")
-            print(f"Required: {', '.join(self.required_cookies)}")
+            print()
+            print("=" * 70)
+            print("🔐 PLEASE COMPLETE AUTHENTICATION")
+            print("=" * 70)
+            print()
+            print("1. Enter your username and password")
+            print("2. Complete MFA (authenticator app, SMS, etc.)")
+            print("3. Wait until you see your inbox/calendar")
+            print()
+            print(f"Waiting for authentication cookies: {', '.join(self.required_cookies)}")
+            print("=" * 70)
+            print()
 
-            # Wait for all required cookies to appear
+            # Wait for all required cookies to appear AND for OWA to fully load
             cookies_found = {}
+            owa_fully_loaded = False
+            max_wait = 300  # 5 minutes timeout
+            start_time = time.time()
+            initial_wait_done = False
 
-            while len(cookies_found) < len(self.required_cookies):
+            print("⏳ Waiting for you to complete login and MFA...")
+            print("   (Browser will close automatically once authentication is complete)")
+            print()
+
+            while not owa_fully_loaded:
+                if time.time() - start_time > max_wait:
+                    raise AuthenticationError(
+                        f"Timeout waiting for authentication. Found: {list(cookies_found.keys())}, OWA loaded: {owa_fully_loaded}"
+                    )
+
+                # Check cookies
                 all_cookies = driver.get_cookies()
                 for cookie in all_cookies:
                     if cookie["name"] in self.required_cookies:
-                        cookies_found[cookie["name"]] = cookie["value"]
+                        if cookie["name"] not in cookies_found:
+                            cookies_found[cookie["name"]] = cookie["value"]
+                            print(f"⏳ Found cookie: {cookie['name']}")
+
+                # Check if we've reached the OWA page (not login page)
+                current_url = driver.current_url
+
+                # More stringent check: URL should contain mail or calendar paths
+                if (len(cookies_found) >= len(self.required_cookies) and
+                    "outlook.office" in current_url and
+                    "login.microsoftonline" not in current_url):
+
+                    # Give extra time for page to fully load after redirect
+                    if not initial_wait_done:
+                        print("⏳ OWA page detected, waiting for full page load...")
+                        initial_wait_done = True
+                        time.sleep(5)  # Wait 5 seconds for page to settle
+
+                    # Try to detect if the page is truly loaded by checking title or elements
+                    try:
+                        page_title = driver.title.lower()
+                        if any(keyword in page_title for keyword in ['outlook', 'inbox', 'mail', 'calendar']):
+                            print(f"✅ OWA fully loaded (Title: {driver.title[:50]})")
+                            owa_fully_loaded = True
+                            break
+                    except:
+                        pass
+
                 time.sleep(2)
 
-            print(f"✅ All required cookies acquired!")
+            print(f"✅ Authentication complete! Closing browser...")
 
             # Save all cookies
             all_cookie_dict = {c["name"]: c["value"] for c in driver.get_cookies()}

@@ -95,11 +95,14 @@ class AccountConfig:
         self.client_id: Optional[str] = data.get("client_id")
         self.client_secret: Optional[str] = data.get("client_secret")
         self.cookie_file: Path = Path(data.get("cookie_file", f".ews_cookies_{name}.json"))
-        self.required_cookies: list[str] = data.get("required_cookies", ["MRHSession"])
+        # Default cookies based on server type
+        default_cookies = ["ESTSAUTH", "ESTSAUTHPERSISTENT"] if "outlook.office" in (self.server_url or "") else ["MRHSession"]
+        self.required_cookies: list[str] = data.get("required_cookies", default_cookies)
         self.prefix: str = data.get("prefix", "")
         self.category: Optional[str] = data.get("category")
         self.color: str = data.get("color", "blue")
         self.auth_method: str = data.get("auth_method", "selenium" if self.type == "ews_selenium" else "oauth")
+        self.browser: str = data.get("browser", "chrome")  # chrome or edge
 
 
 class SyncConfig:

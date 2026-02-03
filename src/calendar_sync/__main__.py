@@ -25,6 +25,7 @@ def _create_reader(account, cache_manager):
             base_url=base_url,
             cookie_file=account.cookie_file,
             required_cookies=account.required_cookies,
+            browser=account.browser,
         )
         # Build a minimal EWSConfig-like object from account
         from .config import EWSConfig
