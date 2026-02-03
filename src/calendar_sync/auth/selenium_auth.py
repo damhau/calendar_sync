@@ -190,28 +190,32 @@ class SeleniumEWSAuth:
                     time.sleep(2)
                     continue
 
-                # SECOND: Now we're on outlook.office.com - check for cookies
-                if "outlook.office" in current_url:
-                    # Check cookies only when we're on outlook domain
+                # SECOND: Now we're on the target domain - check for cookies
+                # This works for both Office 365 (outlook.office.com) and on-premise (e.g., mail.ext.icrc.org)
+                base_domain = self.base_url.replace("https://", "").replace("http://", "").split("/")[0]
+                is_on_target_domain = base_domain in current_url or "outlook.office" in current_url
+                
+                if is_on_target_domain:
+                    # Check cookies only when we're on the target domain
                     all_cookies = driver.get_cookies()
                     for cookie in all_cookies:
                         if cookie["name"] in self.required_cookies:
                             if cookie["name"] not in cookies_found:
                                 cookies_found[cookie["name"]] = cookie["value"]
-                                print(f"⏳ Found cookie on Outlook domain: {cookie['name']}")
+                                print(f"⏳ Found cookie: {cookie['name']}")
 
                     # THIRD: Check if all cookies are present AND page is loaded
                     if len(cookies_found) >= len(self.required_cookies):
                         # Give extra time for page to fully load after redirect
                         if not initial_wait_done:
-                            print("⏳ All cookies found on Outlook, waiting for page to fully load...")
+                            print("⏳ All cookies found, waiting for page to fully load...")
                             initial_wait_done = True
                             time.sleep(5)  # Wait 5 seconds for page to settle
 
                         # Try to detect if the page is truly loaded by checking title
                         try:
                             page_title = driver.title.lower()
-                            if any(keyword in page_title for keyword in ['outlook', 'inbox', 'mail', 'calendar']):
+                            if any(keyword in page_title for keyword in ['outlook', 'inbox', 'mail', 'calendar', 'owa']):
                                 print(f"✅ OWA fully loaded (Title: {driver.title[:50]})")
                                 owa_fully_loaded = True
                                 break
