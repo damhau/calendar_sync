@@ -96,7 +96,8 @@ class AccountConfig:
         self.client_secret: Optional[str] = data.get("client_secret")
         self.cookie_file: Path = Path(data.get("cookie_file", f".ews_cookies_{name}.json"))
         # Default cookies based on server type
-        default_cookies = ["ESTSAUTH", "ESTSAUTHPERSISTENT"] if "outlook.office" in (self.server_url or "") else ["MRHSession"]
+        # For M365 OWA, look for cookies on outlook.office.com domain (not login.microsoftonline.com)
+        default_cookies = ["UC", "DefaultAnchorMailbox"] if "outlook.office" in (self.server_url or "") else ["MRHSession"]
         self.required_cookies: list[str] = data.get("required_cookies", default_cookies)
         self.prefix: str = data.get("prefix", "")
         self.category: Optional[str] = data.get("category")
