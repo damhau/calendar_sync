@@ -29,6 +29,7 @@ class SeleniumEWSAuth:
         cookie_file: Path,
         required_cookies: Optional[list[str]] = None,
         browser: str = "chrome",
+        use_browser_api: bool = False,
     ):
         """
         Initialize Selenium-based EWS authentication.
@@ -38,12 +39,15 @@ class SeleniumEWSAuth:
             cookie_file: Path to store/load cookies
             required_cookies: List of required cookie names (e.g., ['MRHSession', 'FedAuth'])
             browser: Browser to use ('chrome' or 'edge')
+            use_browser_api: If True, keep browser open for API calls instead of using cookies
         """
         self.base_url = base_url.rstrip("/")
         self.cookie_file = cookie_file
         self.required_cookies = required_cookies or ["MRHSession"]
         self.browser = browser.lower()
+        self.use_browser_api = use_browser_api
         self._cookies: Optional[dict[str, str]] = None
+        self._driver: Optional[webdriver.Chrome] = None  # Keep browser instance
 
     def load_cookies(self) -> Optional[dict[str, str]]:
         """
@@ -216,20 +220,254 @@ class SeleniumEWSAuth:
 
                 time.sleep(2)
 
-            print(f"✅ Authentication complete! Closing browser...")
+            print(f"✅ Authentication complete! Extracting tokens...")
 
             # Save all cookies
             all_cookie_dict = {c["name"]: c["value"] for c in driver.get_cookies()}
 
-            driver.quit()
+            # CRITICAL: Extract X-OWA-CANARY token - required for all OWA API calls
+            # For Office 365 OWA, the canary is obtained via fetch API with credentials
+            canary_token = None
+            
+            # Method 1: Try fetch to get canary from response headers
+            try:
+                print("⏳ Fetching X-OWA-CANARY via service endpoint...")
+                canary_token = driver.execute_script("""
+                    return new Promise((resolve) => {
+                        fetch('/owa/service.svc?action=GetOwaUserConfiguration', {
+                            method: 'POST',
+                            credentials: 'include',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Action': 'GetOwaUserConfiguration'
+                            },
+                            body: JSON.stringify({
+                                "__type": "GetOwaUserConfigurationRequest:#Exchange",
+                                "Header": {
+                                    "__type": "JsonRequestHeaders:#Exchange",
+                                    "RequestServerVersion": "Exchange2013"
+                                },
+                                "Body": {
+                                    "__type": "GetOwaUserConfigurationRequest:#Exchange",
+                                    "UserConfigurationName": {"__type": "UserConfigurationName:#Exchange", "Name": "OWA.ViewStateConfiguration", "DistinguishedFolderId": {"__type": "DistinguishedFolderId:#Exchange", "Id": "root"}}
+                                }
+                            })
+                        })
+                        .then(resp => {
+                            // The canary is in the response header
+                            let canary = resp.headers.get('X-OWA-CANARY');
+                            if (canary) {
+                                resolve(canary);
+                            } else {
+                                // Also check cookies that might have been set
+                                let cookies = document.cookie.split(';');
+                                for (let c of cookies) {
+                                    if (c.trim().startsWith('X-OWA-CANARY=')) {
+                                        resolve(c.trim().split('=')[1]);
+                                        return;
+                                    }
+                                }
+                                resolve(null);
+                            }
+                        })
+                        .catch(() => resolve(null));
+                        
+                        // Timeout after 5 seconds
+                        setTimeout(() => resolve(null), 5000);
+                    });
+                """)
+                if canary_token:
+                    print(f"✅ Found X-OWA-CANARY from service endpoint")
+            except Exception as e:
+                logger.debug(f"Could not get canary from fetch: {e}")
+
+            # Method 2: Check if it appeared as a cookie after the fetch
+            if not canary_token:
+                time.sleep(1)
+                for cookie in driver.get_cookies():
+                    if cookie["name"] == "X-OWA-CANARY":
+                        canary_token = cookie["value"]
+                        all_cookie_dict["X-OWA-CANARY"] = canary_token
+                        print(f"✅ Found X-OWA-CANARY in cookies after fetch")
+                        break
+
+            # Method 3: Try localStorage
+            if not canary_token:
+                try:
+                    canary_token = driver.execute_script(
+                        "return window.localStorage.getItem('x-owa-canary') || "
+                        "window.localStorage.getItem('X-OWA-CANARY');"
+                    )
+                    if canary_token:
+                        print(f"✅ Found X-OWA-CANARY in localStorage")
+                except Exception as e:
+                    logger.debug(f"Could not get canary from localStorage: {e}")
+
+            # Method 4: Try to extract from OWA's JavaScript boot data
+            if not canary_token:
+                try:
+                    canary_token = driver.execute_script("""
+                        try {
+                            // Try multiple known locations where OWA stores the canary
+                            if (window.g_CanaryValue) return window.g_CanaryValue;
+                            if (window.odataCanary) return window.odataCanary;
+                            if (window.__owa_boot && window.__owa_boot.canary) return window.__owa_boot.canary;
+                            if (typeof Boot !== 'undefined' && Boot.canary) return Boot.canary;
+                            
+                            // Search in script tags for canary patterns
+                            var scripts = document.getElementsByTagName('script');
+                            for (var i = 0; i < scripts.length; i++) {
+                                var content = scripts[i].innerHTML;
+                                var match = content.match(/"canary"\\s*:\\s*"([^"]+)"/);
+                                if (match) return match[1];
+                                match = content.match(/CanaryValue\\s*=\\s*"([^"]+)"/);
+                                if (match) return match[1];
+                                match = content.match(/x-owa-canary['"\\s:]+['"]([^'"]+)['"]/i);
+                                if (match) return match[1];
+                            }
+                            return null;
+                        } catch(e) { return null; }
+                    """)
+                    if canary_token:
+                        print(f"✅ Found X-OWA-CANARY in page JavaScript")
+                except Exception as e:
+                    logger.debug(f"Could not get canary from JS context: {e}")
+
+            # Method 5: Try sessionStorage
+            if not canary_token:
+                try:
+                    canary_token = driver.execute_script("""
+                        // Check sessionStorage
+                        for (let i = 0; i < sessionStorage.length; i++) {
+                            let key = sessionStorage.key(i);
+                            if (key.toLowerCase().includes('canary')) {
+                                return sessionStorage.getItem(key);
+                            }
+                        }
+                        // Check for OWA boot data in various forms
+                        try {
+                            if (window.O365Shell && window.O365Shell.FlexPane) {
+                                let data = window.O365Shell.FlexPane.HeaderButton;
+                                if (data && data.canary) return data.canary;
+                            }
+                        } catch(e) {}
+                        return null;
+                    """)
+                    if canary_token:
+                        print(f"✅ Found X-OWA-CANARY in sessionStorage")
+                except Exception as e:
+                    logger.debug(f"Could not get canary from sessionStorage: {e}")
+
+            # Method 6: Navigate to calendar and capture canary from network
+            if not canary_token:
+                try:
+                    print("⏳ Navigating to calendar to trigger canary generation...")
+                    driver.get(f"{self.base_url}/owa/?path=/calendar")
+                    time.sleep(3)
+                    
+                    # Check cookies again
+                    for cookie in driver.get_cookies():
+                        if cookie["name"] == "X-OWA-CANARY":
+                            canary_token = cookie["value"]
+                            all_cookie_dict["X-OWA-CANARY"] = canary_token
+                            print(f"✅ Found X-OWA-CANARY after calendar navigation")
+                            break
+                    
+                    # If still no canary, try extracting from OWA's internal state
+                    if not canary_token:
+                        canary_token = driver.execute_script("""
+                            // Try to find canary in OWA's React state or internal objects
+                            try {
+                                // Check window.__PRELOADED_STATE__ (common in React apps)
+                                if (window.__PRELOADED_STATE__ && window.__PRELOADED_STATE__.session) {
+                                    return window.__PRELOADED_STATE__.session.canary;
+                                }
+                            } catch(e) {}
+                            
+                            // Try to get it from a network request by triggering one
+                            try {
+                                // Look for any element that might have the canary as a data attribute
+                                let allElements = document.querySelectorAll('[data-canary]');
+                                if (allElements.length > 0) {
+                                    return allElements[0].getAttribute('data-canary');
+                                }
+                            } catch(e) {}
+                            
+                            // Check all script tags for canary patterns
+                            let scripts = document.getElementsByTagName('script');
+                            for (let i = 0; i < scripts.length; i++) {
+                                let content = scripts[i].textContent || scripts[i].innerHTML;
+                                if (content) {
+                                    // Look for canary in JSON-like structures
+                                    let patterns = [
+                                        /"canary"\s*:\s*"([^"]+)"/,
+                                        /'canary'\s*:\s*'([^']+)'/,
+                                        /canary['"]\s*:\s*['"]([\w\-\.]+)['"]/,
+                                        /X-OWA-CANARY['"]\s*:\s*['"]([\w\-\.]+)['"]/i
+                                    ];
+                                    for (let pattern of patterns) {
+                                        let match = content.match(pattern);
+                                        if (match) return match[1];
+                                    }
+                                }
+                            }
+                            return null;
+                        """)
+                        if canary_token:
+                            print(f"✅ Found X-OWA-CANARY from page analysis")
+                    
+                    # Update all cookies after navigation
+                    if canary_token:
+                        all_cookie_dict = {c["name"]: c["value"] for c in driver.get_cookies()}
+                except Exception as e:
+                    logger.debug(f"Calendar navigation failed: {e}")
+                except Exception as e:
+                    logger.debug(f"Calendar navigation failed: {e}")
+
+            if canary_token:
+                all_cookie_dict["X-OWA-CANARY"] = canary_token
+                print(f"✅ X-OWA-CANARY token captured: {canary_token[:30]}...")
+            else:
+                print("⚠️  WARNING: Could not find X-OWA-CANARY token!")
+                if self.use_browser_api:
+                    print("   Browser will stay open for API calls.")
+                else:
+                    print("   OWA API calls may fail with 401 Unauthorized.")
+
+            # If use_browser_api is enabled, keep the browser open
+            if self.use_browser_api and not canary_token:
+                print("✅ Keeping browser open for API calls (use_browser_api=true)")
+                self._driver = driver
+                # Navigate to calendar for API calls
+                driver.get(f"{self.base_url}/owa/?path=/calendar")
+                time.sleep(2)
+            else:
+                print(f"✅ Closing browser...")
+                driver.quit()
 
             self.save_cookies(all_cookie_dict)
             return all_cookie_dict
 
         except Exception as e:
             logger.error(f"Browser automation failed: {e}")
-            driver.quit()
+            try:
+                driver.quit()
+            except:
+                pass
             raise AuthenticationError(f"Failed to get cookies from browser: {e}") from e
+    
+    def has_browser(self) -> bool:
+        """Check if browser is available for API calls."""
+        return self._driver is not None
+    
+    def close_browser(self) -> None:
+        """Close the browser if it's open."""
+        if self._driver:
+            try:
+                self._driver.quit()
+            except:
+                pass
+            self._driver = None
 
     def get_cookies(self, force_refresh: bool = False) -> dict[str, str]:
         """
@@ -253,11 +491,93 @@ class SeleniumEWSAuth:
 
         if cookies:
             logger.info("Using cached cookies")
+            
+            # For use_browser_api mode, we need to launch browser for API calls
+            # even when using cached cookies (Office 365 requires browser context)
+            if self.use_browser_api and "X-OWA-CANARY" not in cookies:
+                logger.info("Launching browser for API calls (use_browser_api mode)...")
+                self._launch_browser_for_api(cookies)
+            
             return cookies
 
         # If no valid cookies, get new ones from browser
         logger.info("No valid cached cookies, launching browser...")
         return self.fetch_cookies_from_browser()
+    
+    def _launch_browser_for_api(self, cookies: dict[str, str]) -> None:
+        """
+        Launch browser with existing cookies for making API calls.
+        
+        This is used when use_browser_api is enabled and we have cached cookies
+        but no canary token (Office 365 scenario).
+        """
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        
+        print("🌐 Launching browser for API calls...")
+        
+        if self.browser == "edge":
+            try:
+                from selenium.webdriver.edge.options import Options
+                options = Options()
+                options.add_experimental_option("detach", False)
+                options.add_argument("--disable-blink-features=AutomationControlled")
+                driver = webdriver.Edge(options=options)
+            except ImportError:
+                raise AuthenticationError("Edge WebDriver not available")
+        else:
+            options = ChromeOptions()
+            options.add_experimental_option("detach", False)
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            driver = webdriver.Chrome(options=options)
+        
+        try:
+            # Navigate to OWA first to set cookies on the right domain
+            driver.get(f"{self.base_url}/owa/")
+            time.sleep(2)
+            
+            # Add cookies (only ones that belong to this domain)
+            for name, value in cookies.items():
+                if name != "X-OWA-CANARY":  # Don't set the canary we don't have
+                    try:
+                        driver.add_cookie({"name": name, "value": value})
+                    except Exception as e:
+                        logger.debug(f"Could not add cookie {name}: {e}")
+            
+            # Navigate to calendar and wait for authentication
+            print("🔗 Navigating to calendar...")
+            driver.get(f"{self.base_url}/owa/?path=/calendar")
+            
+            # Wait for page to load
+            WebDriverWait(driver, 10).until(
+                lambda d: d.current_url != "data:," and d.current_url != "about:blank"
+            )
+            
+            # Check if we're redirected to login
+            if "login.microsoftonline" in driver.current_url:
+                print("🔐 Please complete authentication in the browser...")
+                # Wait for authentication to complete
+                max_wait = 300
+                start_time = time.time()
+                while "login.microsoftonline" in driver.current_url:
+                    if time.time() - start_time > max_wait:
+                        driver.quit()
+                        raise AuthenticationError("Authentication timeout")
+                    time.sleep(2)
+            
+            print("⏳ Waiting for calendar to load...")
+            time.sleep(5)
+            
+            # Store the driver for API calls
+            self._driver = driver
+            print("✅ Browser ready for API calls")
+            
+        except Exception as e:
+            logger.error(f"Failed to launch browser for API: {e}")
+            try:
+                driver.quit()
+            except:
+                pass
+            raise
 
     def validate_cookies(self, cookies: dict[str, str]) -> bool:
         """
@@ -299,3 +619,423 @@ class SeleniumEWSAuth:
         if self.cookie_file.exists():
             self.cookie_file.unlink()
             logger.info("Cookie cache cleared")
+
+    def fetch_calendar_events_via_browser(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> Optional[list[dict]]:
+        """
+        Fetch calendar events by making API calls from within the browser context.
+        
+        This is necessary for Office 365 where the OAuth tokens are not accessible
+        as simple cookies.
+        
+        Args:
+            start_date: Start date in ISO format (YYYY-MM-DDTHH:MM:SSZ)
+            end_date: End date in ISO format (YYYY-MM-DDTHH:MM:SSZ)
+            
+        Returns:
+            List of calendar events as dictionaries, or None if failed
+        """
+        # Reuse existing browser if available (from use_browser_api mode)
+        if self._driver:
+            print("📅 Using existing browser session for API calls...")
+            driver = self._driver
+            need_to_close = False
+        else:
+            print("🌐 Opening new browser to fetch calendar events...")
+            need_to_close = True
+            
+            # Create browser
+            if self.browser == "edge":
+                try:
+                    from selenium.webdriver.edge.options import Options
+                    options = Options()
+                    options.add_experimental_option("detach", False)
+                    options.add_argument("--disable-blink-features=AutomationControlled")
+                    driver = webdriver.Edge(options=options)
+                except ImportError:
+                    raise AuthenticationError("Edge WebDriver not available")
+            else:
+                options = ChromeOptions()
+                options.add_experimental_option("detach", False)
+                options.add_argument("--disable-blink-features=AutomationControlled")
+                driver = webdriver.Chrome(options=options)
+        
+        try:
+            # Navigate to OWA calendar if not already there
+            current_url = driver.current_url
+            if "calendar" not in current_url.lower():
+                calendar_url = f"{self.base_url}/owa/?path=/calendar"
+                print(f"🔗 Navigating to {calendar_url}...")
+                driver.get(calendar_url)
+            
+            # Wait for page to load and check if we need to authenticate
+            WebDriverWait(driver, 10).until(
+                lambda d: d.current_url != "data:," and d.current_url != "about:blank"
+            )
+            
+            # Check if we're redirected to login
+            if "login.microsoftonline" in driver.current_url:
+                print("🔐 Please complete authentication in the browser...")
+                # Wait for authentication to complete
+                max_wait = 300
+                start_time = time.time()
+                while "login.microsoftonline" in driver.current_url:
+                    if time.time() - start_time > max_wait:
+                        raise AuthenticationError("Authentication timeout")
+                    time.sleep(2)
+                
+                # Wait for OWA to load
+                time.sleep(5)
+            
+            # Wait for calendar page to be ready
+            print("⏳ Waiting for calendar to load...")
+            time.sleep(5)
+            
+            # Make the API call from within the browser using fetch
+            print("📅 Fetching calendar events...")
+            result = driver.execute_script(f"""
+                return new Promise((resolve, reject) => {{
+                    // Try Graph API first (works in OWA context)
+                    fetch('https://outlook.office.com/api/v2.0/me/calendarview?startDateTime={start_date}&endDateTime={end_date}&$top=500&$select=Id,Subject,Start,End,Location,Organizer,Attendees,IsAllDay,IsCancelled,ShowAs,Body,Categories,Recurrence', {{
+                        method: 'GET',
+                        credentials: 'include',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        }}
+                    }})
+                    .then(response => {{
+                        console.log('REST API v2.0 status:', response.status);
+                        if (response.ok) {{
+                            return response.json().then(data => ({{status: response.status, data: data}}));
+                        }} else {{
+                            return response.text().then(text => ({{status: response.status, error: text}}));
+                        }}
+                    }})
+                    .then(result => {{
+                        if (result.data) {{
+                            resolve(JSON.stringify({{success: true, events: result.data.value || [], source: 'rest_v2'}}));
+                        }} else {{
+                            resolve(JSON.stringify({{success: false, error: 'REST API status ' + result.status, detail: result.error}}));
+                        }}
+                    }})
+                    .catch(error => {{
+                        console.error('Calendar API error:', error);
+                        resolve(JSON.stringify({{success: false, error: error.message}}));
+                    }});
+                    
+                    // Timeout after 30 seconds
+                    setTimeout(() => resolve(JSON.stringify({{success: false, error: 'timeout'}})), 30000);
+                }});
+            """)
+            
+            if result:
+                parsed = json.loads(result)
+                if parsed.get('success'):
+                    events = parsed.get('events', [])
+                    print(f"✅ Retrieved {len(events)} events via {parsed.get('source', 'unknown')}")
+                    if need_to_close:
+                        driver.quit()
+                    return events
+                else:
+                    print(f"⚠️  REST API v2.0 failed: {parsed.get('error')}")
+                    if parsed.get('detail'):
+                        print(f"   Detail: {str(parsed.get('detail'))[:200]}")
+            
+            # Try alternative: Use OWA's internal API with more thorough canary search
+            print("⏳ Trying OWA internal API...")
+            result = driver.execute_script(f"""
+                return new Promise((resolve, reject) => {{
+                    (async function() {{
+                    // Get the canary from the page - try MANY locations
+                    let canary = '';
+                    try {{
+                        // Method 1: Common JS variables
+                        if (window.g_CanaryValue) canary = window.g_CanaryValue;
+                        else if (window.__owa_boot && window.__owa_boot.canary) canary = window.__owa_boot.canary;
+                        
+                        // Method 2: Cookies
+                        if (!canary) {{
+                            let cookies = document.cookie.split(';');
+                            for (let c of cookies) {{
+                                if (c.trim().startsWith('X-OWA-CANARY=')) {{
+                                    canary = c.trim().split('=')[1];
+                                    break;
+                                }}
+                            }}
+                        }}
+                        
+                        // Method 3: sessionStorage
+                        if (!canary) {{
+                            for (let i = 0; i < sessionStorage.length; i++) {{
+                                let key = sessionStorage.key(i);
+                                let value = sessionStorage.getItem(key);
+                                if (key.toLowerCase().includes('canary') || 
+                                    (value && value.length > 20 && value.length < 200 && /^[a-zA-Z0-9_-]+$/.test(value))) {{
+                                    canary = value;
+                                    break;
+                                }}
+                            }}
+                        }}
+                        
+                        // Method 4: Look in script tags
+                        if (!canary) {{
+                            let scripts = document.getElementsByTagName('script');
+                            for (let i = 0; i < scripts.length; i++) {{
+                                let content = scripts[i].textContent || '';
+                                let match = content.match(/"canary"\s*:\s*"([^"]+)"/);
+                                if (match) {{
+                                    canary = match[1];
+                                    break;
+                                }}
+                            }}
+                        }}
+                        
+                        // Method 5: Try to get from network performance entries
+                        if (!canary && window.performance) {{
+                            let entries = performance.getEntriesByType('resource');
+                            for (let entry of entries) {{
+                                if (entry.name && entry.name.includes('X-OWA-CANARY=')) {{
+                                    let match = entry.name.match(/X-OWA-CANARY=([^&]+)/);
+                                    if (match) canary = match[1];
+                                    break;
+                                }}
+                            }}
+                        }}
+                    }} catch(e) {{
+                        console.error('Canary search error:', e);
+                    }}
+                    
+                    console.log('Using canary:', canary ? canary.substring(0, 20) + '...' : 'none');
+                    
+                    // Try multiple OWA API endpoints (different paths for different Office 365 versions)
+                    const endpoints = [
+                        '/owa/0/service.svc?action=GetCalendarView',
+                        '/mail/0/service.svc?action=GetCalendarView',
+                        '/owa/service.svc?action=GetCalendarView',
+                        '/mail/service.svc?action=GetCalendarView'
+                    ];
+                    
+                    let lastError = null;
+                    let lastStatus = null;
+                    
+                    async function tryEndpoint(endpoint) {{
+                        try {{
+                            console.log('Trying endpoint:', endpoint);
+                            const response = await fetch(endpoint, {{
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: {{
+                                    'Content-Type': 'application/json',
+                                    'Action': 'GetCalendarView',
+                                    'X-OWA-CANARY': canary,
+                                    'X-Requested-With': 'XMLHttpRequest'
+                                }},
+                                body: JSON.stringify({{
+                                    "__type": "GetCalendarViewJsonRequest:#Exchange",
+                                    "Header": {{
+                                        "__type": "JsonRequestHeaders:#Exchange",
+                                        "RequestServerVersion": "Exchange2016"
+                                    }},
+                                    "Body": {{
+                                        "__type": "GetCalendarViewRequest:#Exchange",
+                                        "FolderId": {{
+                                            "__type": "DistinguishedFolderId:#Exchange",
+                                            "Id": "calendar"
+                                        }},
+                                        "StartDate": "{start_date}",
+                                        "EndDate": "{end_date}"
+                                    }}
+                                }})
+                            }});
+                            
+                            console.log('Endpoint', endpoint, 'status:', response.status);
+                            lastStatus = response.status;
+                            
+                            if (response.ok) {{
+                                const text = await response.text();
+                                if (text && text.trim()) {{
+                                    try {{
+                                        return {{success: true, data: JSON.parse(text)}};
+                                    }} catch(e) {{
+                                        lastError = 'Invalid JSON';
+                                    }}
+                                }}
+                            }} else {{
+                                lastError = 'HTTP ' + response.status;
+                            }}
+                        }} catch(e) {{
+                            console.error('Endpoint error:', e);
+                            lastError = e.message;
+                        }}
+                        return {{success: false}};
+                    }}
+                    
+                    // Try each endpoint
+                    for (const endpoint of endpoints) {{
+                        const result = await tryEndpoint(endpoint);
+                        if (result.success) {{
+                            let items = [];
+                            try {{
+                                const data = result.data;
+                                if (data.Body && data.Body.Items) {{
+                                    items = data.Body.Items;
+                                }} else if (data.Body && data.Body.ResponseMessages) {{
+                                    const msgs = data.Body.ResponseMessages.Items;
+                                    if (msgs && msgs[0] && msgs[0].RootFolder) {{
+                                        items = msgs[0].RootFolder.Items || [];
+                                    }}
+                                }}
+                            }} catch(e) {{
+                                console.error('Parse error:', e);
+                            }}
+                            resolve(JSON.stringify({{items: items, status: lastStatus, hasCanary: !!canary, endpoint: endpoint}}));
+                            return;
+                        }}
+                    }}
+                    
+                    // All endpoints failed
+                    resolve(JSON.stringify({{items: [], error: lastError, status: lastStatus, hasCanary: !!canary}}));
+                    }})();  // End of async IIFE
+                    
+                    setTimeout(() => resolve(JSON.stringify({{items: [], error: 'timeout', hasCanary: false}})), 30000);
+                }});
+            """)
+            
+            if result:
+                parsed = json.loads(result)
+                events = parsed.get('items', [])
+                error = parsed.get('error')
+                has_canary = parsed.get('hasCanary', False)
+                status = parsed.get('status', 'unknown')
+                endpoint = parsed.get('endpoint', 'unknown')
+                
+                if error:
+                    print(f"⚠️  OWA API error: {error} (status: {status}, hasCanary: {has_canary})")
+                elif len(events) > 0:
+                    print(f"✅ Retrieved {len(events)} events via OWA API ({endpoint})")
+                    if need_to_close:
+                        driver.quit()
+                    return events
+                else:
+                    print(f"📅 OWA API returned 0 events (endpoint: {endpoint}, hasCanary: {has_canary})")
+            
+            # Method 3: Extract events from DOM (most reliable for Office 365)
+            print("⏳ Extracting events from calendar DOM...")
+            dom_events = driver.execute_script("""
+                let events = [];
+                try {
+                    // Look for calendar event elements with aria-labels
+                    // Format: "Subject, HH:MM to HH:MM, Day, Month DD, YYYY, ..."
+                    const selectors = [
+                        '[role="button"][aria-label*="event"]',
+                        '[role="button"][aria-label*=", "][aria-label*=" to "]',
+                        '[data-automation-id="CalendarEventCard"]',
+                        '.ms-CalendarEvent'
+                    ];
+                    
+                    let foundElements = new Set();
+                    
+                    for (const selector of selectors) {
+                        const elements = document.querySelectorAll(selector);
+                        for (const el of elements) {
+                            const label = el.getAttribute('aria-label');
+                            if (label && label.length > 10 && label.includes(' to ')) {
+                                // Avoid duplicates
+                                if (foundElements.has(label)) continue;
+                                foundElements.add(label);
+                                
+                                // Parse the aria-label
+                                // Format: "Subject, HH:MM to HH:MM, DayName, Month DD, YYYY, [By Organizer], [Status], [Recurring event]"
+                                const parts = label.split(', ');
+                                if (parts.length >= 4) {
+                                    const subject = parts[0];
+                                    const timeRange = parts[1]; // "09:00 to 12:00"
+                                    
+                                    // Find date parts (look for day name)
+                                    let dayName = '';
+                                    let monthDay = '';
+                                    let year = '';
+                                    let organizer = '';
+                                    let isRecurring = label.includes('Recurring event');
+                                    
+                                    for (let i = 2; i < parts.length; i++) {
+                                        const part = parts[i].trim();
+                                        if (['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].some(d => part.startsWith(d))) {
+                                            dayName = part;
+                                        } else if (['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].some(m => part.startsWith(m))) {
+                                            monthDay = part;
+                                        } else if (/^\\d{4}$/.test(part)) {
+                                            year = part;
+                                        } else if (part.startsWith('By ')) {
+                                            organizer = part.substring(3);
+                                        }
+                                    }
+                                    
+                                    // Parse time range
+                                    let startTime = '';
+                                    let endTime = '';
+                                    const timeMatch = timeRange.match(/(\\d{1,2}:\\d{2})\\s+to\\s+(\\d{1,2}:\\d{2})/);
+                                    if (timeMatch) {
+                                        startTime = timeMatch[1];
+                                        endTime = timeMatch[2];
+                                    }
+                                    
+                                    // Build ISO date strings
+                                    let startDate = null;
+                                    let endDate = null;
+                                    if (monthDay && year) {
+                                        const dateStr = monthDay + ' ' + year;
+                                        const parsed = new Date(dateStr);
+                                        if (!isNaN(parsed.getTime())) {
+                                            const datePrefix = parsed.toISOString().split('T')[0];
+                                            startDate = datePrefix + 'T' + (startTime || '00:00') + ':00';
+                                            endDate = datePrefix + 'T' + (endTime || '23:59') + ':00';
+                                        }
+                                    }
+                                    
+                                    events.push({
+                                        Subject: subject,
+                                        Start: startDate ? {DateTime: startDate, TimeZone: 'UTC'} : null,
+                                        End: endDate ? {DateTime: endDate, TimeZone: 'UTC'} : null,
+                                        Organizer: organizer ? {EmailAddress: {Name: organizer}} : null,
+                                        IsRecurring: isRecurring,
+                                        _rawLabel: label,
+                                        _source: 'dom'
+                                    });
+                                }
+                            }
+                        }
+                    }
+                } catch(e) {
+                    console.error('DOM extraction error:', e);
+                }
+                return JSON.stringify(events);
+            """)
+            
+            if dom_events:
+                dom_parsed = json.loads(dom_events)
+                if len(dom_parsed) > 0:
+                    print(f"✅ Extracted {len(dom_parsed)} events from calendar DOM")
+                    if need_to_close:
+                        driver.quit()
+                    return dom_parsed
+            
+            # Only close browser if we opened it ourselves (not in use_browser_api mode)
+            if need_to_close:
+                driver.quit()
+            
+            print("❌ Could not retrieve calendar events via any method")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Browser calendar fetch failed: {e}")
+            if need_to_close:
+                try:
+                    driver.quit()
+                except:
+                    pass
+            return None

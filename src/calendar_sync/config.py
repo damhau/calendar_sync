@@ -103,6 +103,9 @@ class AccountConfig:
         self.color: str = data.get("color", "blue")
         self.auth_method: str = data.get("auth_method", "selenium" if self.type == "ews_selenium" else "oauth")
         self.browser: str = data.get("browser", "chrome")  # chrome or edge
+        # Use browser for API calls (required for Office 365 OWA without Graph API access)
+        # When true, the browser stays open and API calls are made via JavaScript
+        self.use_browser_api: bool = data.get("use_browser_api", False)
 
 
 class SyncConfig:

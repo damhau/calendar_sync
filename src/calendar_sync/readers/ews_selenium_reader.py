@@ -230,6 +230,94 @@ class EWSSeleniumReader(CalendarReader):
         self.selenium_auth = selenium_auth
         self.config = config
         self._session: Optional[requests.Session] = None
+        self._canary_token: Optional[str] = None
+
+    def _fetch_canary_token(self, session: requests.Session) -> Optional[str]:
+        """Fetch X-OWA-CANARY token from OWA endpoints."""
+        import re
+        
+        # Method 1: Load OWA page and extract canary from HTML/cookies
+        try:
+            url = f"{self.config.server_url.rstrip('/')}/owa/"
+            resp = session.get(url, timeout=15, allow_redirects=True)
+            
+            # Check if canary was set as a cookie
+            canary = session.cookies.get("X-OWA-CANARY")
+            if canary:
+                logger.info("✅ Fetched X-OWA-CANARY from cookie after OWA page load")
+                return canary
+            
+            # Check response headers
+            canary = resp.headers.get("X-OWA-CANARY")
+            if canary:
+                logger.info("✅ Fetched X-OWA-CANARY from response headers")
+                return canary
+            
+            # Try to extract from page content
+            if resp.status_code == 200:
+                # Look for canary in various formats
+                patterns = [
+                    r'"canary"\s*:\s*"([^"]+)"',
+                    r"'canary'\s*:\s*'([^']+)'",
+                    r'X-OWA-CANARY["\s:]+["\']([^"\']+)["\']',
+                    r'owaCanary["\s:]+["\']([^"\']+)["\']',
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, resp.text)
+                    if match:
+                        logger.info(f"✅ Extracted X-OWA-CANARY from OWA page content")
+                        return match.group(1)
+        except Exception as e:
+            logger.debug(f"Failed to get canary from OWA page: {e}")
+        
+        # Method 2: Try sessiondata.ashx
+        try:
+            url = f"{self.config.server_url.rstrip('/')}/owa/sessiondata.ashx?cid=0&fmt=json"
+            resp = session.get(url, timeout=15)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    canary = data.get("owaCanary") or data.get("canary")
+                    if canary:
+                        logger.info("✅ Fetched X-OWA-CANARY from sessiondata.ashx")
+                        return canary
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Failed to get canary from sessiondata: {e}")
+        
+        # Method 3: Try the service endpoint which might return canary in response headers
+        try:
+            url = f"{self.config.server_url.rstrip('/')}/owa/service.svc?action=GetOwaUserConfiguration"
+            headers = {
+                "Content-Type": "application/json",
+                "Action": "GetOwaUserConfiguration",
+            }
+            payload = {
+                "__type": "GetOwaUserConfigurationRequest:#Exchange",
+                "Header": {
+                    "__type": "JsonRequestHeaders:#Exchange",
+                    "RequestServerVersion": "Exchange2013"
+                },
+                "Body": {}
+            }
+            resp = session.post(url, json=payload, headers=headers, timeout=15)
+            
+            canary = resp.headers.get("X-OWA-CANARY")
+            if canary:
+                logger.info("✅ Fetched X-OWA-CANARY from service response headers")
+                return canary
+            
+            # Check if set as cookie
+            canary = session.cookies.get("X-OWA-CANARY")
+            if canary:
+                logger.info("✅ Fetched X-OWA-CANARY from cookie after service call")
+                return canary
+                    
+        except Exception as e:
+            logger.debug(f"Failed to fetch canary from service: {e}")
+        
+        return None
 
     def _get_session(self) -> requests.Session:
         """Get or create an authenticated requests session."""
@@ -237,12 +325,342 @@ class EWSSeleniumReader(CalendarReader):
             cookies = self.selenium_auth.get_cookies()
             self._session = requests.Session()
             self._session.cookies.update(cookies)
+            
+            # Get canary token from cookies or fetch it
+            self._canary_token = cookies.get("X-OWA-CANARY", "")
+            
+            if not self._canary_token:
+                logger.warning("X-OWA-CANARY not in cookies, attempting to fetch...")
+                self._canary_token = self._fetch_canary_token(self._session) or ""
+            
+            if not self._canary_token:
+                logger.warning("⚠️  No X-OWA-CANARY token available - will try REST API fallback")
+            else:
+                logger.info(f"✅ Using X-OWA-CANARY token: {self._canary_token[:20]}...")
+            
             self._session.headers.update({
                 "User-Agent": USER_AGENT,
                 "Content-Type": "application/json; charset=utf-8",
-                "X-OWA-CANARY": cookies.get("X-OWA-CANARY", ""),
+                "X-OWA-CANARY": self._canary_token,
             })
         return self._session
+
+    def _is_office365(self) -> bool:
+        """Check if this is Office 365 (outlook.office.com) vs on-premise Exchange."""
+        return "outlook.office" in self.config.server_url.lower()
+
+    def _rest_api_get_events(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> Optional[list[dict]]:
+        """Try to get events using Outlook REST API v2.0 (works for Office 365)."""
+        session = self._get_session()
+        
+        # Format dates for REST API
+        start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        # Try the Outlook REST API v2.0 calendarview endpoint
+        url = f"{self.config.server_url.rstrip('/')}/api/v2.0/me/calendarview"
+        params = {
+            "startDateTime": start_str,
+            "endDateTime": end_str,
+            "$top": 500,
+            "$select": "Id,Subject,Start,End,Location,Organizer,Attendees,IsAllDay,IsCancelled,ShowAs,Body,Categories,Recurrence",
+        }
+        
+        try:
+            resp = session.get(url, params=params, timeout=30)
+            logger.warning(f"REST API v2.0 calendarview: status={resp.status_code}, url={url}")
+            if resp.status_code != 200:
+                logger.warning(f"REST API v2.0 error response: {resp.text[:500]}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                events = data.get("value", [])
+                logger.info(f"✅ REST API returned {len(events)} events")
+                return events
+        except Exception as e:
+            logger.warning(f"REST API calendarview exception: {e}")
+        
+        # Try OWA calendar API endpoint used by the web UI
+        try:
+            url = f"{self.config.server_url.rstrip('/')}/owa/calendar/api/v1.0/me/calendarview"
+            params = {
+                "startDateTime": start_str,
+                "endDateTime": end_str,
+            }
+            resp = session.get(url, params=params, timeout=30)
+            logger.warning(f"OWA calendar API: status={resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                events = data.get("value", [])
+                logger.info(f"✅ OWA calendar API returned {len(events)} events")
+                return events
+            else:
+                logger.warning(f"OWA calendar API error: {resp.text[:300]}")
+        except Exception as e:
+            logger.warning(f"OWA calendar API exception: {e}")
+
+        # Try alternative endpoint: /owa/0/calendars/action/finditem
+        try:
+            url = f"{self.config.server_url.rstrip('/')}/owa/0/calendars/action/finditem"
+            payload = {
+                "request": {
+                    "__type": "FindItemRequest:#Exchange",
+                    "ItemShape": {"BaseShape": "Default"},
+                    "ParentFolderIds": [{"__type": "DistinguishedFolderId:#Exchange", "Id": "calendar"}],
+                    "Traversal": "Shallow",
+                }
+            }
+            resp = session.post(url, json=payload, timeout=30)
+            logger.warning(f"OWA finditem endpoint: status={resp.status_code}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.info(f"✅ OWA calendars endpoint returned data")
+                return data.get("Items", [])
+            else:
+                logger.warning(f"OWA finditem error: {resp.text[:300]}")
+        except Exception as e:
+            logger.warning(f"OWA calendars endpoint failed: {e}")
+        
+        return None
+
+    def _parse_rest_api_events(
+        self,
+        events: list[dict],
+        start: datetime,
+        end: datetime,
+    ) -> list[CalendarEvent]:
+        """Parse events from Outlook REST API v2.0 format."""
+        results = []
+        
+        for item in events:
+            try:
+                # REST API uses different field names than OWA service
+                item_id = item.get("Id", "")
+                subject = item.get("Subject") or "(No Subject)"
+                
+                # Parse body
+                body_obj = item.get("Body", {})
+                body_text = body_obj.get("Content") if isinstance(body_obj, dict) else None
+                
+                # Parse dates - REST API format: {"DateTime": "...", "TimeZone": "..."}
+                start_obj = item.get("Start", {})
+                end_obj = item.get("End", {})
+                
+                if isinstance(start_obj, dict):
+                    start_str = start_obj.get("DateTime", "")
+                else:
+                    start_str = str(start_obj) if start_obj else ""
+                    
+                if isinstance(end_obj, dict):
+                    end_str = end_obj.get("DateTime", "")
+                else:
+                    end_str = str(end_obj) if end_obj else ""
+                
+                if not start_str:
+                    continue
+                    
+                start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00")) if end_str else start_dt + timedelta(hours=1)
+                
+                # Parse location
+                loc_obj = item.get("Location", {})
+                location = None
+                if loc_obj:
+                    loc_name = loc_obj.get("DisplayName") if isinstance(loc_obj, dict) else str(loc_obj)
+                    if loc_name:
+                        location = Location(display_name=loc_name)
+                
+                is_all_day = item.get("IsAllDay", False)
+                is_cancelled = item.get("IsCancelled", False)
+                is_recurring = item.get("Recurrence") is not None
+                
+                # Parse organizer
+                organizer = None
+                org = item.get("Organizer", {})
+                if org:
+                    email_addr = org.get("EmailAddress", {})
+                    if email_addr:
+                        organizer = Attendee(
+                            email=email_addr.get("Address", ""),
+                            name=email_addr.get("Name"),
+                            is_organizer=True,
+                        )
+                
+                # Parse attendees
+                attendees = []
+                for att in item.get("Attendees", []) or []:
+                    email_addr = att.get("EmailAddress", {})
+                    if email_addr:
+                        attendees.append(
+                            Attendee(
+                                email=email_addr.get("Address", ""),
+                                name=email_addr.get("Name"),
+                                is_organizer=False,
+                            )
+                        )
+                
+                show_as = (item.get("ShowAs") or "Busy").lower()
+                status = EventStatus.CANCELLED if is_cancelled else EventStatus.CONFIRMED
+                
+                event = CalendarEvent(
+                    id=item_id,
+                    source_system="ews",
+                    ical_uid=item.get("iCalUId"),
+                    subject=subject,
+                    body=body_text,
+                    start=ensure_utc(start_dt),
+                    end=ensure_utc(end_dt),
+                    is_all_day=is_all_day,
+                    timezone="UTC",
+                    organizer=organizer,
+                    attendees=attendees,
+                    location=location,
+                    status=status,
+                    sensitivity=(item.get("Sensitivity") or "Normal").lower(),
+                    show_as=show_as,
+                    categories=item.get("Categories", []) or [],
+                    is_recurring=is_recurring,
+                )
+                
+                if not self._should_skip(event):
+                    results.append(event)
+                    
+            except Exception as e:
+                logger.warning(f"Failed to parse REST API event: {e}")
+                continue
+        
+        logger.info(f"Parsed {len(results)} events from REST API")
+        return results
+
+    def _parse_dom_events(
+        self,
+        events: list[dict],
+        start: datetime,
+        end: datetime,
+    ) -> list[CalendarEvent]:
+        """Parse events extracted from OWA DOM (aria-labels).
+        
+        DOM events have format:
+        {
+            Subject: "Meeting Title",
+            Start: {DateTime: "2026-02-03T09:00:00", TimeZone: "UTC"},
+            End: {DateTime: "2026-02-03T10:00:00", TimeZone: "UTC"},
+            Organizer: {EmailAddress: {Name: "John Doe"}},
+            IsRecurring: true/false,
+            _rawLabel: "full aria-label text",
+            _source: "dom"
+        }
+        """
+        results = []
+        
+        for item in events:
+            try:
+                # Check if this is a DOM event
+                if item.get("_source") != "dom":
+                    continue
+                    
+                subject = item.get("Subject") or "(No Subject)"
+                
+                # Parse dates
+                start_obj = item.get("Start", {})
+                end_obj = item.get("End", {})
+                
+                start_str = start_obj.get("DateTime", "") if isinstance(start_obj, dict) else ""
+                end_str = end_obj.get("DateTime", "") if isinstance(end_obj, dict) else ""
+                
+                if not start_str:
+                    # If no parsed date, skip this event
+                    logger.debug(f"Skipping DOM event without date: {subject}")
+                    continue
+                
+                # Parse datetime strings - ensure timezone awareness
+                try:
+                    if "T" in start_str:
+                        # Check if already has timezone info
+                        if "+" in start_str or "Z" in start_str:
+                            start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                        else:
+                            # Assume UTC if no timezone
+                            start_dt = datetime.fromisoformat(start_str + "+00:00")
+                    else:
+                        start_dt = datetime.fromisoformat(start_str + "T00:00:00+00:00")
+                    # Ensure timezone aware
+                    start_dt = ensure_utc(start_dt)
+                except ValueError:
+                    logger.debug(f"Could not parse date {start_str} for event: {subject}")
+                    continue
+                    
+                try:
+                    if end_str and "T" in end_str:
+                        if "+" in end_str or "Z" in end_str:
+                            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                        else:
+                            end_dt = datetime.fromisoformat(end_str + "+00:00")
+                    elif end_str:
+                        end_dt = datetime.fromisoformat(end_str + "T23:59:00+00:00")
+                    else:
+                        end_dt = start_dt + timedelta(hours=1)
+                    # Ensure timezone aware
+                    end_dt = ensure_utc(end_dt)
+                except ValueError:
+                    end_dt = start_dt + timedelta(hours=1)
+                
+                # Filter by date range
+                if start_dt < start or start_dt > end:
+                    continue
+                
+                is_recurring = item.get("IsRecurring", False)
+                
+                # Parse organizer
+                organizer = None
+                org = item.get("Organizer", {})
+                if org:
+                    email_addr = org.get("EmailAddress", {}) if isinstance(org, dict) else {}
+                    if email_addr:
+                        organizer = Attendee(
+                            email="",  # DOM doesn't give us email
+                            name=email_addr.get("Name"),
+                            is_organizer=True,
+                        )
+                
+                # Generate a pseudo-ID from the event details
+                import hashlib
+                event_hash = hashlib.md5(
+                    f"{subject}|{start_str}|{end_str}".encode()
+                ).hexdigest()
+                
+                event = CalendarEvent(
+                    id=f"dom-{event_hash}",
+                    source_system="ews",
+                    subject=subject,
+                    start=ensure_utc(start_dt),
+                    end=ensure_utc(end_dt),
+                    is_all_day=False,  # Can't reliably determine from DOM
+                    timezone="UTC",
+                    organizer=organizer,
+                    attendees=[],
+                    location=None,  # Not available from DOM
+                    status=EventStatus.CONFIRMED,
+                    sensitivity="normal",
+                    show_as="busy",
+                    categories=[],
+                    is_recurring=is_recurring,
+                )
+                
+                if not self._should_skip(event):
+                    results.append(event)
+                    
+            except Exception as e:
+                logger.warning(f"Failed to parse DOM event: {e}")
+                continue
+        
+        logger.info(f"Parsed {len(results)} events from DOM")
+        return results
 
     def _owa_action(self, action: str, body: dict) -> dict:
         """Call OWA service.svc with a given action and body."""
@@ -285,6 +703,24 @@ class EWSSeleniumReader(CalendarReader):
 
     def list_calendars(self) -> list[Calendar]:
         """List calendars from Exchange."""
+        # Initialize session to check canary status
+        self._get_session()
+        
+        # For Office 365 without canary, just return a default calendar
+        # since we'll use REST API for events anyway
+        if self._is_office365() and not self._canary_token:
+            logger.info("Using default calendar (no canary token for Office 365)")
+            return [
+                Calendar(
+                    id="primary",
+                    name="Calendar",
+                    owner_email=self.config.primary_email,
+                    source_system="ews",
+                    is_default=True,
+                    can_edit=True,
+                )
+            ]
+        
         try:
             body = {
                 "__type": "GetFolderRequest:#Exchange",
@@ -327,8 +763,41 @@ class EWSSeleniumReader(CalendarReader):
     ) -> list[CalendarEvent]:
         """Read events from Exchange calendar."""
         try:
+            # Initialize session to check canary status
+            self._get_session()
+            
             start = ensure_utc(start_date) if start_date else ensure_utc(datetime(2020, 1, 1))
             end = ensure_utc(end_date) if end_date else ensure_utc(datetime(2030, 1, 1))
+
+            # For Office 365 without canary, use browser-based API calls
+            if self._is_office365() and not self._canary_token:
+                logger.info("Using browser-based API calls for Office 365...")
+                start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+                end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+                browser_events = self.selenium_auth.fetch_calendar_events_via_browser(
+                    start_str, end_str
+                )
+                
+                if browser_events is not None and len(browser_events) > 0:
+                    # Check if these are DOM events or REST API events
+                    first_event = browser_events[0] if browser_events else {}
+                    if first_event.get("_source") == "dom":
+                        return self._parse_dom_events(browser_events, start, end)
+                    else:
+                        return self._parse_rest_api_events(browser_events, start, end)
+                
+                logger.warning("Browser-based API failed, trying cookie-based approaches...")
+                
+                # Try REST API as fallback
+                rest_events = self._rest_api_get_events(start, end)
+                if rest_events is not None:
+                    return self._parse_rest_api_events(rest_events, start, end)
+                    
+                raise CalendarReadError(
+                    "Could not access Office 365 calendar. The OAuth tokens are not accessible. "
+                    "Consider using the 'm365' account type with device code flow instead."
+                )
 
             # Fetch all items (OWA JSON API doesn't support CalendarView filtering)
             body = {
