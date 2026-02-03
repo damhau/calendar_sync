@@ -29,7 +29,8 @@ def _create_reader(account, cache_manager):
         # Build a minimal EWSConfig-like object from account
         from .config import EWSConfig
 
-        ews_cfg = EWSConfig(
+        # Use model_construct to bypass environment variable loading
+        ews_cfg = EWSConfig.model_construct(
             server_url=account.server_url,
             primary_email=account.primary_email,
             auth_method="selenium",
@@ -37,7 +38,8 @@ def _create_reader(account, cache_manager):
         )
         return EWSSeleniumReader(selenium_auth, ews_cfg)
     elif account.type in ("m365", "m365_read"):
-        m365_cfg = M365Config(
+        # Use model_construct to bypass environment variable loading
+        m365_cfg = M365Config.model_construct(
             tenant_id=account.tenant_id,
             client_id=account.client_id,
             client_secret=account.client_secret,
@@ -238,7 +240,8 @@ def main() -> int:
             if target_account.type.startswith("m365"):
                 from .writers.m365_writer import M365CalendarWriter
 
-                m365_cfg = M365Config(
+                # Use model_construct to bypass environment variable loading
+                m365_cfg = M365Config.model_construct(
                     tenant_id=target_account.tenant_id,
                     client_id=target_account.client_id,
                     client_secret=target_account.client_secret,

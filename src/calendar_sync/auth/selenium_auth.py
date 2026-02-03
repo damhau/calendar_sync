@@ -105,7 +105,6 @@ class SeleniumEWSAuth:
         print("🌐 Opening Chrome to let you log in...")
 
         options = Options()
-        options.binary_location = "/snap/bin/chromium"
         options.add_experimental_option("detach", False)
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
@@ -116,7 +115,10 @@ class SeleniumEWSAuth:
 
         # Let Selenium automatically manage the driver
         driver = webdriver.Chrome(options=options)
-
+        # options = Options()
+        # options.add_experimental_option("detach", False)
+        # driver = webdriver.Chrome(options=options)
+        # # driver.get(BASE_URL)
         try:
             login_url = f"{self.base_url}/owa"
             print(f"🔗 Navigating to {login_url}...")

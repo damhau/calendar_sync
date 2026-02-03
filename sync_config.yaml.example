@@ -1,0 +1,57 @@
+# Calendar Sync Configuration
+# This file defines multiple calendar accounts and sync relationships
+
+# Define all calendar accounts
+accounts:
+  # Example M365 account (as a source)
+  work_calendar:
+    type: m365  # or m365_read for read-only
+    tenant_id: your-tenant-id
+    client_id: your-client-id
+    client_secret: your-client-secret
+    # Optional: prefix to add to event titles when syncing
+    prefix: "[Work]"
+    # Optional: category to apply to synced events
+    category: Work
+    # Optional: color for the category (used when creating categories)
+    color: blue
+
+  # Example EWS Selenium account (as a source)
+  old_exchange:
+    type: ews_selenium
+    server_url: https://mail.company.com/EWS/Exchange.asmx
+    primary_email: user@company.com
+    cookie_file: .ews_cookies_old_exchange.json
+    required_cookies:
+      - MRHSession
+    prefix: "[Old]"
+    category: OldExchange
+    color: red
+
+  # Example M365 target account
+  personal_calendar:
+    type: m365
+    tenant_id: your-personal-tenant-id
+    client_id: your-personal-client-id
+    client_secret: your-personal-client-secret
+
+# Sync configuration
+sync:
+  # List of source accounts to sync FROM
+  sources:
+    - work_calendar
+    - old_exchange
+
+  # Target account to sync TO
+  target: personal_calendar
+
+  # Number of days to look back (0 = start from today)
+  lookback_days: 0
+
+  # Number of days to look ahead
+  lookahead_days: 7
+
+# Optional: Skip events with these subjects (case-insensitive)
+skip_subjects:
+  - "canceled"
+  - "test event"
