@@ -170,46 +170,49 @@ class SeleniumEWSAuth:
             initial_wait_done = False
 
             print("⏳ Waiting for you to complete login and MFA...")
-            print("   (Browser will close automatically once authentication is complete)")
+            print("   (Browser will close automatically once you reach your inbox)")
             print()
 
             while not owa_fully_loaded:
                 if time.time() - start_time > max_wait:
                     raise AuthenticationError(
-                        f"Timeout waiting for authentication. Found: {list(cookies_found.keys())}, OWA loaded: {owa_fully_loaded}"
+                        f"Timeout waiting for authentication. OWA loaded: {owa_fully_loaded}, URL: {driver.current_url[:50]}"
                     )
 
-                # Check cookies
-                all_cookies = driver.get_cookies()
-                for cookie in all_cookies:
-                    if cookie["name"] in self.required_cookies:
-                        if cookie["name"] not in cookies_found:
-                            cookies_found[cookie["name"]] = cookie["value"]
-                            print(f"⏳ Found cookie: {cookie['name']}")
-
-                # Check if we've reached the OWA page (not login page)
                 current_url = driver.current_url
 
-                # More stringent check: URL should contain mail or calendar paths
-                if (len(cookies_found) >= len(self.required_cookies) and
-                    "outlook.office" in current_url and
-                    "login.microsoftonline" not in current_url):
+                # FIRST: Wait until we're completely off the login page
+                if "login.microsoftonline" in current_url:
+                    time.sleep(2)
+                    continue
 
-                    # Give extra time for page to fully load after redirect
-                    if not initial_wait_done:
-                        print("⏳ OWA page detected, waiting for full page load...")
-                        initial_wait_done = True
-                        time.sleep(5)  # Wait 5 seconds for page to settle
+                # SECOND: Now we're on outlook.office.com - check for cookies
+                if "outlook.office" in current_url:
+                    # Check cookies only when we're on outlook domain
+                    all_cookies = driver.get_cookies()
+                    for cookie in all_cookies:
+                        if cookie["name"] in self.required_cookies:
+                            if cookie["name"] not in cookies_found:
+                                cookies_found[cookie["name"]] = cookie["value"]
+                                print(f"⏳ Found cookie on Outlook domain: {cookie['name']}")
 
-                    # Try to detect if the page is truly loaded by checking title or elements
-                    try:
-                        page_title = driver.title.lower()
-                        if any(keyword in page_title for keyword in ['outlook', 'inbox', 'mail', 'calendar']):
-                            print(f"✅ OWA fully loaded (Title: {driver.title[:50]})")
-                            owa_fully_loaded = True
-                            break
-                    except:
-                        pass
+                    # THIRD: Check if all cookies are present AND page is loaded
+                    if len(cookies_found) >= len(self.required_cookies):
+                        # Give extra time for page to fully load after redirect
+                        if not initial_wait_done:
+                            print("⏳ All cookies found on Outlook, waiting for page to fully load...")
+                            initial_wait_done = True
+                            time.sleep(5)  # Wait 5 seconds for page to settle
+
+                        # Try to detect if the page is truly loaded by checking title
+                        try:
+                            page_title = driver.title.lower()
+                            if any(keyword in page_title for keyword in ['outlook', 'inbox', 'mail', 'calendar']):
+                                print(f"✅ OWA fully loaded (Title: {driver.title[:50]})")
+                                owa_fully_loaded = True
+                                break
+                        except:
+                            pass
 
                 time.sleep(2)
 
