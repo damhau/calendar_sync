@@ -58,27 +58,41 @@ def _create_reader(account, cache_manager):
         raise ValueError(f"Unknown account type: {account.type}")
 
 
-def _filter_events_by_day(events: list, account) -> list:
+def _filter_events_by_day(events: list, account, logger=None) -> list:
     """Filter events based on include_days and exclude_days settings."""
+    import logging
+    log = logger or logging.getLogger(__name__)
+
     if not account.include_days and not account.exclude_days:
         return events
 
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     filtered = []
+    excluded_count = 0
+
     for event in events:
         # Get the day of week (0=Monday, 6=Sunday)
         day_of_week = event.start.weekday()
+        day_name = day_names[day_of_week]
 
         # If include_days is set, only include those days
         if account.include_days:
             if day_of_week not in account.include_days:
+                log.info(f"  ⏭️  Skipping '{event.subject}' - {day_name} not in include_days")
+                excluded_count += 1
                 continue
 
         # If exclude_days is set, exclude those days
         if account.exclude_days:
             if day_of_week in account.exclude_days:
+                log.info(f"  ⏭️  Skipping '{event.subject}' - {day_name} in exclude_days")
+                excluded_count += 1
                 continue
 
         filtered.append(event)
+
+    if excluded_count > 0:
+        log.info(f"  📅 Day filter: {excluded_count} event(s) excluded, {len(filtered)} remaining")
 
     return filtered
 
