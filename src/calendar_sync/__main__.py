@@ -2,7 +2,12 @@
 
 import argparse
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+
+# Initialize SSL truststore early, before any HTTPS imports
+from .utils.ssl_utils import init_ssl
+init_ssl()
 
 from .auth.msal_auth import M365AuthProvider
 from .auth.selenium_auth import SeleniumEWSAuth
@@ -45,11 +50,37 @@ def _create_reader(account, cache_manager):
             tenant_id=account.tenant_id,
             client_id=account.client_id,
             client_secret=account.client_secret,
+            primary_email=account.primary_email,
         )
         m365_auth = M365AuthProvider(m365_cfg, cache_manager)
-        return M365CalendarReader(m365_auth)
+        return M365CalendarReader(m365_auth, primary_email=account.primary_email)
     else:
         raise ValueError(f"Unknown account type: {account.type}")
+
+
+def _filter_events_by_day(events: list, account) -> list:
+    """Filter events based on include_days and exclude_days settings."""
+    if not account.include_days and not account.exclude_days:
+        return events
+
+    filtered = []
+    for event in events:
+        # Get the day of week (0=Monday, 6=Sunday)
+        day_of_week = event.start.weekday()
+
+        # If include_days is set, only include those days
+        if account.include_days:
+            if day_of_week not in account.include_days:
+                continue
+
+        # If exclude_days is set, exclude those days
+        if account.exclude_days:
+            if day_of_week in account.exclude_days:
+                continue
+
+        filtered.append(event)
+
+    return filtered
 
 
 def main() -> int:
@@ -105,6 +136,24 @@ def main() -> int:
         help="Days to look ahead (overrides config)",
     )
     parser.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        help="Sync only a specific date (YYYY-MM-DD format, e.g., 2026-02-04)",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Start date for sync range (YYYY-MM-DD format)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="End date for sync range (YYYY-MM-DD format)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -149,9 +198,42 @@ def main() -> int:
                 return 1
 
         # Resolve sync window
-        lookback = args.lookback if args.lookback is not None else sync_config.lookback_days
-        lookahead = args.lookahead if args.lookahead is not None else sync_config.lookahead_days
-        start, end = get_sync_window(lookback, lookahead)
+        if args.date:
+            # Single day mode
+            try:
+                import pytz
+                day = datetime.strptime(args.date, "%Y-%m-%d")
+                start = day.replace(hour=0, minute=0, second=0, tzinfo=pytz.utc)
+                end = day.replace(hour=23, minute=59, second=59, tzinfo=pytz.utc)
+                logger.info(f"Syncing single day: {args.date}")
+            except ValueError:
+                logger.error(f"Invalid date format: {args.date}. Use YYYY-MM-DD (e.g., 2026-02-04)")
+                return 1
+        elif args.start_date or args.end_date:
+            # Custom date range mode
+            import pytz
+            try:
+                if args.start_date:
+                    start = datetime.strptime(args.start_date, "%Y-%m-%d")
+                    start = start.replace(hour=0, minute=0, second=0, tzinfo=pytz.utc)
+                else:
+                    start = datetime.now(pytz.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+                if args.end_date:
+                    end = datetime.strptime(args.end_date, "%Y-%m-%d")
+                    end = end.replace(hour=23, minute=59, second=59, tzinfo=pytz.utc)
+                else:
+                    end = start + timedelta(days=7)
+
+                logger.info(f"Syncing date range: {start.date()} to {end.date()}")
+            except ValueError as e:
+                logger.error(f"Invalid date format. Use YYYY-MM-DD (e.g., 2026-02-04). Error: {e}")
+                return 1
+        else:
+            # Default: use lookback/lookahead
+            lookback = args.lookback if args.lookback is not None else sync_config.lookback_days
+            lookahead = args.lookahead if args.lookahead is not None else sync_config.lookahead_days
+            start, end = get_sync_window(lookback, lookahead)
 
         # List calendars
         if args.list_calendars:
@@ -181,6 +263,9 @@ def main() -> int:
                     e for e in events
                     if e.subject.lower().strip() not in sync_config.skip_subjects
                 ]
+
+                # Apply day filtering (include_days / exclude_days)
+                events = _filter_events_by_day(events, account)
 
                 # Apply prefix and category
                 for e in events:
@@ -225,6 +310,9 @@ def main() -> int:
                     if e.subject.lower().strip() not in sync_config.skip_subjects
                 ]
 
+                # Apply day filtering (include_days / exclude_days)
+                events = _filter_events_by_day(events, account)
+
                 # Apply prefix and category
                 for e in events:
                     if account.prefix and not e.subject.startswith(account.prefix):
@@ -247,9 +335,10 @@ def main() -> int:
                     tenant_id=target_account.tenant_id,
                     client_id=target_account.client_id,
                     client_secret=target_account.client_secret,
+                    primary_email=target_account.primary_email,
                 )
                 m365_auth = M365AuthProvider(m365_cfg, cache_manager)
-                target_writer = M365CalendarWriter(m365_auth)
+                target_writer = M365CalendarWriter(m365_auth, primary_email=target_account.primary_email)
             else:
                 logger.error(f"Writing to {target_account.type} not supported")
                 return 1

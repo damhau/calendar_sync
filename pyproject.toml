@@ -20,6 +20,7 @@ dependencies = [
     "selenium>=4.0.0",
     "webdriver-manager>=4.0.0",
     "pyyaml>=6.0",
+    "truststore>=0.9.0",  # Use OS native certificate store for SSL
 ]
 
 [project.optional-dependencies]

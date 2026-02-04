@@ -19,15 +19,23 @@ logger = logging.getLogger(__name__)
 class M365CalendarReader(CalendarReader):
     """Read calendars from Microsoft 365 using Graph API."""
 
-    def __init__(self, auth_provider: M365AuthProvider):
+    def __init__(self, auth_provider: M365AuthProvider, primary_email: Optional[str] = None):
         """
         Initialize M365 calendar reader.
 
         Args:
             auth_provider: Microsoft 365 authentication provider
+            primary_email: Email address of user (required for client credentials flow)
         """
         self.auth_provider = auth_provider
+        self.primary_email = primary_email
+        self.use_client_credentials = auth_provider.use_client_credentials
         self._client: Optional[GraphClient] = None
+
+        if self.use_client_credentials and not primary_email:
+            raise CalendarReadError(
+                "primary_email is required when using client credentials flow (client_secret configured)"
+            )
 
     @property
     def client(self) -> GraphClient:
@@ -40,10 +48,20 @@ class M365CalendarReader(CalendarReader):
             self._client = GraphClient(token_func)
         return self._client
 
+    @property
+    def _user_endpoint(self):
+        """Get the correct user endpoint based on auth type."""
+        if self.use_client_credentials:
+            # App-only auth: use /users/{email}
+            return self.client.users[self.primary_email]
+        else:
+            # Delegated auth: use /me
+            return self._user_endpoint
+
     def list_calendars(self) -> list[Calendar]:
         """List all calendars for the authenticated user."""
         try:
-            calendars_result = self.client.me.calendars.get().execute_query()
+            calendars_result = self._user_endpoint.calendars.get().execute_query()
             result = []
 
             for cal in calendars_result:
@@ -83,9 +101,9 @@ class M365CalendarReader(CalendarReader):
         try:
             # Get calendar reference
             if calendar_id:
-                calendar = self.client.me.calendars[calendar_id]
+                calendar = self._user_endpoint.calendars[calendar_id]
             else:
-                calendar = self.client.me.calendar
+                calendar = self._user_endpoint.calendar
 
             # Build query
             query = calendar.events
@@ -127,14 +145,14 @@ class M365CalendarReader(CalendarReader):
         try:
             if calendar_id:
                 event = (
-                    self.client.me.calendars[calendar_id]
+                    self._user_endpoint.calendars[calendar_id]
                     .events[event_id]
                     .get()
                     .execute_query()
                 )
             else:
                 event = (
-                    self.client.me.calendar.events[event_id].get().execute_query()
+                    self._user_endpoint.calendar.events[event_id].get().execute_query()
                 )
 
             return self._transform_event(event)

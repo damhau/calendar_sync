@@ -1,6 +1,7 @@
 """Exchange calendar reader using OWA REST API with Selenium-based cookie authentication."""
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -557,15 +558,20 @@ class EWSSeleniumReader(CalendarReader):
         }
         """
         results = []
-        
+        logger.info(f"Processing {len(events)} DOM events, date range: {start} to {end}")
+
         for item in events:
             try:
-                # Check if this is a DOM event
-                if item.get("_source") != "dom":
-                    continue
-                    
+                # Debug: log item structure
+                source = item.get("_source")
                 subject = item.get("Subject") or "(No Subject)"
-                
+                logger.debug(f"Processing event: {subject}, _source={source}, Start={item.get('Start')}")
+
+                # Check if this is a DOM event
+                if source != "dom":
+                    logger.debug(f"Skipping non-DOM event: {subject} (source={source})")
+                    continue
+
                 # Parse dates
                 start_obj = item.get("Start", {})
                 end_obj = item.get("End", {})
@@ -574,45 +580,73 @@ class EWSSeleniumReader(CalendarReader):
                 end_str = end_obj.get("DateTime", "") if isinstance(end_obj, dict) else ""
                 
                 if not start_str:
-                    # If no parsed date, skip this event
-                    logger.debug(f"Skipping DOM event without date: {subject}")
-                    continue
+                    # If no parsed date, try to parse from raw label
+                    raw_label = item.get("_rawLabel", "")
+                    logger.warning(f"DOM event missing date, raw label: {raw_label[:200]}")
+
+                    # Try to parse date from raw label directly
+                    parsed_date = self._parse_date_from_aria_label(raw_label)
+                    if parsed_date:
+                        start_str = parsed_date.get("start", "")
+                        end_str = parsed_date.get("end", "")
+                        logger.info(f"Parsed date from raw label: {start_str} to {end_str}")
+
+                    if not start_str:
+                        logger.debug(f"Skipping DOM event without date: {subject}")
+                        continue
                 
-                # Parse datetime strings - ensure timezone awareness
+                # Parse datetime strings - DOM times are in LOCAL timezone, not UTC
+                # Get local timezone for proper conversion
+                import pytz
+                from datetime import timezone as dt_timezone
+                try:
+                    # Try to get local timezone
+                    local_tz = datetime.now().astimezone().tzinfo
+                except Exception:
+                    local_tz = dt_timezone.utc
+
                 try:
                     if "T" in start_str:
                         # Check if already has timezone info
                         if "+" in start_str or "Z" in start_str:
                             start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
                         else:
-                            # Assume UTC if no timezone
-                            start_dt = datetime.fromisoformat(start_str + "+00:00")
+                            # DOM times are in LOCAL timezone, not UTC
+                            start_dt = datetime.fromisoformat(start_str)
+                            start_dt = start_dt.replace(tzinfo=local_tz)
                     else:
-                        start_dt = datetime.fromisoformat(start_str + "T00:00:00+00:00")
-                    # Ensure timezone aware
+                        start_dt = datetime.fromisoformat(start_str + "T00:00:00")
+                        start_dt = start_dt.replace(tzinfo=local_tz)
+                    # Convert to UTC
                     start_dt = ensure_utc(start_dt)
                 except ValueError:
                     logger.debug(f"Could not parse date {start_str} for event: {subject}")
                     continue
-                    
+
                 try:
                     if end_str and "T" in end_str:
                         if "+" in end_str or "Z" in end_str:
                             end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
                         else:
-                            end_dt = datetime.fromisoformat(end_str + "+00:00")
+                            # DOM times are in LOCAL timezone
+                            end_dt = datetime.fromisoformat(end_str)
+                            end_dt = end_dt.replace(tzinfo=local_tz)
                     elif end_str:
-                        end_dt = datetime.fromisoformat(end_str + "T23:59:00+00:00")
+                        end_dt = datetime.fromisoformat(end_str + "T23:59:00")
+                        end_dt = end_dt.replace(tzinfo=local_tz)
                     else:
                         end_dt = start_dt + timedelta(hours=1)
-                    # Ensure timezone aware
+                    # Convert to UTC
                     end_dt = ensure_utc(end_dt)
                 except ValueError:
                     end_dt = start_dt + timedelta(hours=1)
                 
                 # Filter by date range
                 if start_dt < start or start_dt > end:
+                    logger.debug(f"Event {subject} outside date range: {start_dt} not in [{start}, {end}]")
                     continue
+
+                # logger.info(f"✅ Event passed all filters: {subject} at {start_dt}")
                 
                 is_recurring = item.get("IsRecurring", False)
                 
@@ -661,6 +695,101 @@ class EWSSeleniumReader(CalendarReader):
         
         logger.info(f"Parsed {len(results)} events from DOM")
         return results
+
+    def _parse_date_from_aria_label(self, label: str) -> dict | None:
+        """Parse date/time from aria-label using various formats.
+
+        Handles formats like:
+        - "Subject, 09:00 to 10:00, Wednesday, February 05, 2026, ..."
+        - "Subject, 09:00 bis 10:00, Mittwoch, 05. Februar 2026, ..."  (German)
+        - "Subject, 09:00 à 10:00, mercredi 5 février 2026, ..."  (French)
+        """
+        if not label:
+            return None
+
+        # Parse time range - handle various formats
+        time_patterns = [
+            r'(\d{1,2}:\d{2})\s+to\s+(\d{1,2}:\d{2})',  # English
+            r'(\d{1,2}:\d{2})\s+bis\s+(\d{1,2}:\d{2})',  # German
+            r'(\d{1,2}:\d{2})\s+à\s+(\d{1,2}:\d{2})',   # French
+            r'(\d{1,2}:\d{2})\s+-\s+(\d{1,2}:\d{2})',   # Dash separator
+        ]
+
+        start_time = None
+        end_time = None
+        for pattern in time_patterns:
+            match = re.search(pattern, label)
+            if match:
+                start_time = match.group(1)
+                end_time = match.group(2)
+                break
+
+        # Try to extract date - multiple approaches
+        # Approach 1: Look for full date patterns
+        date_patterns = [
+            # English: "February 05, 2026" or "February 5, 2026"
+            r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
+            # German: "05. Februar 2026"
+            r'(\d{1,2})\.\s*(Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)\s+(\d{4})',
+            # French: "5 février 2026"
+            r'(\d{1,2})\s+(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+(\d{4})',
+            # ISO-like in label: "2026-02-05"
+            r'(\d{4})-(\d{2})-(\d{2})',
+            # Numeric: "05/02/2026" or "05.02.2026"
+            r'(\d{1,2})[./](\d{1,2})[./](\d{4})',
+        ]
+
+        month_map = {
+            # English
+            'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+            'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+            # German
+            'januar': 1, 'februar': 2, 'märz': 3, 'mai': 5, 'juni': 6,
+            'juli': 7, 'august': 8, 'oktober': 10, 'dezember': 12,
+            # French
+            'janvier': 1, 'février': 2, 'mars': 3, 'avril': 4, 'juin': 6,
+            'juillet': 7, 'août': 8, 'septembre': 9, 'octobre': 10, 'novembre': 11, 'décembre': 12,
+        }
+
+        year = None
+        month = None
+        day = None
+
+        for i, pattern in enumerate(date_patterns):
+            match = re.search(pattern, label, re.IGNORECASE)
+            if match:
+                if i == 0:  # English: Month Day, Year
+                    month = month_map.get(match.group(1).lower())
+                    day = int(match.group(2))
+                    year = int(match.group(3))
+                elif i == 1:  # German: Day. Month Year
+                    day = int(match.group(1))
+                    month = month_map.get(match.group(2).lower())
+                    year = int(match.group(3))
+                elif i == 2:  # French: Day Month Year
+                    day = int(match.group(1))
+                    month = month_map.get(match.group(2).lower())
+                    year = int(match.group(3))
+                elif i == 3:  # ISO: Year-Month-Day
+                    year = int(match.group(1))
+                    month = int(match.group(2))
+                    day = int(match.group(3))
+                elif i == 4:  # Numeric: Day/Month/Year (European)
+                    day = int(match.group(1))
+                    month = int(match.group(2))
+                    year = int(match.group(3))
+                break
+
+        if not all([year, month, day]):
+            logger.debug(f"Could not extract date from label: {label[:100]}...")
+            return None
+
+        # Build ISO date strings
+        date_prefix = f"{year:04d}-{month:02d}-{day:02d}"
+        start_str = f"{date_prefix}T{start_time or '00:00'}:00"
+        end_str = f"{date_prefix}T{end_time or '23:59'}:00"
+
+        return {"start": start_str, "end": end_str}
 
     def _owa_action(self, action: str, body: dict) -> dict:
         """Call OWA service.svc with a given action and body."""

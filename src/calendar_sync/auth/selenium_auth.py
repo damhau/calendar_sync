@@ -143,7 +143,7 @@ class SeleniumEWSAuth:
         # driver = webdriver.Chrome(options=options)
         # # driver.get(BASE_URL)
         try:
-            login_url = f"{self.base_url}/owa"
+            login_url = f"{self.base_url}/owa/?path=/calendar"
             print(f"🔗 Navigating to {login_url}...")
             driver.get(login_url)
 
@@ -404,10 +404,10 @@ class SeleniumEWSAuth:
                                 if (content) {
                                     // Look for canary in JSON-like structures
                                     let patterns = [
-                                        /"canary"\s*:\s*"([^"]+)"/,
-                                        /'canary'\s*:\s*'([^']+)'/,
-                                        /canary['"]\s*:\s*['"]([\w\-\.]+)['"]/,
-                                        /X-OWA-CANARY['"]\s*:\s*['"]([\w\-\.]+)['"]/i
+                                        /"canary"\\s*:\\s*"([^"]+)"/,
+                                        /'canary'\\s*:\\s*'([^']+)'/,
+                                        /canary['"]\\s*:\\s*['"]([\w\\-\\.]+)['"]/,
+                                        /X-OWA-CANARY['"]\\s*:\\s*['"]([\w\\-\\.]+)['"]/i
                                     ];
                                     for (let pattern of patterns) {
                                         let match = content.match(pattern);
@@ -790,7 +790,7 @@ class SeleniumEWSAuth:
                             let scripts = document.getElementsByTagName('script');
                             for (let i = 0; i < scripts.length; i++) {{
                                 let content = scripts[i].textContent || '';
-                                let match = content.match(/"canary"\s*:\s*"([^"]+)"/);
+                                let match = content.match(/"canary"\\s*:\\s*"([^"]+)"/);
                                 if (match) {{
                                     canary = match[1];
                                     break;
@@ -979,25 +979,51 @@ class SeleniumEWSAuth:
                                         }
                                     }
                                     
-                                    // Parse time range
+                                    // Parse time range - handle both 24h and 12h AM/PM formats
                                     let startTime = '';
                                     let endTime = '';
-                                    const timeMatch = timeRange.match(/(\\d{1,2}:\\d{2})\\s+to\\s+(\\d{1,2}:\\d{2})/);
-                                    if (timeMatch) {
-                                        startTime = timeMatch[1];
-                                        endTime = timeMatch[2];
+
+                                    // Helper to convert 12h to 24h format
+                                    function to24h(time, period) {
+                                        if (!time) return '';
+                                        let [h, m] = time.split(':').map(Number);
+                                        if (period && period.toUpperCase() === 'PM' && h !== 12) h += 12;
+                                        if (period && period.toUpperCase() === 'AM' && h === 12) h = 0;
+                                        return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+                                    }
+
+                                    // Try 12-hour format with AM/PM: "1:30 PM to 3:30 PM" or "1:30 PM to 3:30"
+                                    const timeMatch12 = timeRange.match(/(\\d{1,2}:\\d{2})\\s*(AM|PM)?\\s+to\\s+(\\d{1,2}:\\d{2})\\s*(AM|PM)?/i);
+                                    if (timeMatch12) {
+                                        let startPeriod = timeMatch12[2] || timeMatch12[4] || 'PM'; // Default to PM if not specified
+                                        let endPeriod = timeMatch12[4] || startPeriod; // End period defaults to start period
+                                        startTime = to24h(timeMatch12[1], startPeriod);
+                                        endTime = to24h(timeMatch12[3], endPeriod);
+                                    } else {
+                                        // Try 24-hour format: "09:00 to 12:00"
+                                        const timeMatch24 = timeRange.match(/(\\d{1,2}:\\d{2})\\s+to\\s+(\\d{1,2}:\\d{2})/);
+                                        if (timeMatch24) {
+                                            startTime = timeMatch24[1].padStart(5, '0');
+                                            endTime = timeMatch24[2].padStart(5, '0');
+                                        }
                                     }
                                     
-                                    // Build ISO date strings
+                                    // Build ISO date strings - avoid timezone issues by parsing manually
                                     let startDate = null;
                                     let endDate = null;
                                     if (monthDay && year) {
-                                        const dateStr = monthDay + ' ' + year;
-                                        const parsed = new Date(dateStr);
-                                        if (!isNaN(parsed.getTime())) {
-                                            const datePrefix = parsed.toISOString().split('T')[0];
-                                            startDate = datePrefix + 'T' + (startTime || '00:00') + ':00';
-                                            endDate = datePrefix + 'T' + (endTime || '23:59') + ':00';
+                                        // Parse month and day directly to avoid timezone conversion issues
+                                        const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+                                                           'July', 'August', 'September', 'October', 'November', 'December'];
+                                        const monthMatch = monthDay.match(/([A-Za-z]+)\\s+(\\d+)/);
+                                        if (monthMatch) {
+                                            const monthIdx = monthNames.findIndex(m => m.toLowerCase() === monthMatch[1].toLowerCase());
+                                            const day = parseInt(monthMatch[2]);
+                                            if (monthIdx >= 0 && day > 0) {
+                                                const datePrefix = year + '-' + String(monthIdx + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+                                                startDate = datePrefix + 'T' + (startTime || '00:00') + ':00';
+                                                endDate = datePrefix + 'T' + (endTime || '23:59') + ':00';
+                                            }
                                         }
                                     }
                                     
@@ -1023,7 +1049,12 @@ class SeleniumEWSAuth:
             if dom_events:
                 dom_parsed = json.loads(dom_events)
                 if len(dom_parsed) > 0:
-                    print(f"✅ Extracted {len(dom_parsed)} events from calendar DOM")
+                    # print(f"✅ Extracted {len(dom_parsed)} events from calendar DOM")
+                    # Debug: show all events
+                    for i, ev in enumerate(dom_parsed):
+                        start = ev.get('Start')
+                        start_dt = start.get('DateTime') if start else 'None'
+                        # print(f"  [{i+1}] {ev.get('Subject', '?')[:50]} | Start: {start_dt} | Raw: {ev.get('_rawLabel', '')[:80]}...")
                     if need_to_close:
                         driver.quit()
                     return dom_parsed

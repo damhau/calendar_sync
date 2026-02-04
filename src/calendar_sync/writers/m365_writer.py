@@ -50,10 +50,27 @@ CATEGORY_COLORS = {
 class M365CalendarWriter(CalendarWriter):
     """Write events to Microsoft 365 using Graph API."""
 
-    def __init__(self, auth_provider: M365AuthProvider):
+    def __init__(self, auth_provider: M365AuthProvider, primary_email: Optional[str] = None):
         self.auth_provider = auth_provider
+        self.primary_email = primary_email
+        self.use_client_credentials = auth_provider.use_client_credentials
         self._existing_events: Optional[dict[str, str]] = None
         self._ensured_categories: set[str] = set()
+
+        if self.use_client_credentials and not primary_email:
+            raise CalendarWriteError(
+                "primary_email is required when using client credentials flow (client_secret configured)"
+            )
+
+    @property
+    def _user_path(self) -> str:
+        """Get the correct user path based on auth type."""
+        if self.use_client_credentials:
+            # App-only auth: use /users/{email}
+            return f"users/{self.primary_email}"
+        else:
+            # Delegated auth: use /me
+            return "me"
 
     def _headers(self) -> dict[str, str]:
         token = self.auth_provider.get_access_token()
@@ -69,7 +86,7 @@ class M365CalendarWriter(CalendarWriter):
 
         preset = CATEGORY_COLORS.get(color.lower(), color)
         # Check if category already exists
-        url = f"{GRAPH_BASE}/me/outlook/masterCategories"
+        url = f"{GRAPH_BASE}/{self._user_path}/outlook/masterCategories"
         resp = requests.get(url, headers=self._headers())
         resp.raise_for_status()
         existing = {cat["displayName"]: cat for cat in resp.json().get("value", [])}
@@ -97,9 +114,9 @@ class M365CalendarWriter(CalendarWriter):
     ) -> dict[str, str]:
         """Fetch existing events and return a dict of (subject, start) -> event_id for dedup."""
         if calendar_id:
-            url = f"{GRAPH_BASE}/me/calendars/{calendar_id}/calendarView"
+            url = f"{GRAPH_BASE}/{self._user_path}/calendars/{calendar_id}/calendarView"
         else:
-            url = f"{GRAPH_BASE}/me/calendarView"
+            url = f"{GRAPH_BASE}/{self._user_path}/calendarView"
 
         params = {
             "startDateTime": start.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -154,9 +171,9 @@ class M365CalendarWriter(CalendarWriter):
     ) -> str:
         try:
             if calendar_id:
-                url = f"{GRAPH_BASE}/me/calendars/{calendar_id}/events"
+                url = f"{GRAPH_BASE}/{self._user_path}/calendars/{calendar_id}/events"
             else:
-                url = f"{GRAPH_BASE}/me/calendar/events"
+                url = f"{GRAPH_BASE}/{self._user_path}/calendar/events"
 
             resp = requests.post(url, headers=self._headers(), json=self._to_graph_format(event))
             resp.raise_for_status()
@@ -174,9 +191,9 @@ class M365CalendarWriter(CalendarWriter):
     ) -> None:
         try:
             if calendar_id:
-                url = f"{GRAPH_BASE}/me/calendars/{calendar_id}/events/{event.id}"
+                url = f"{GRAPH_BASE}/{self._user_path}/calendars/{calendar_id}/events/{event.id}"
             else:
-                url = f"{GRAPH_BASE}/me/calendar/events/{event.id}"
+                url = f"{GRAPH_BASE}/{self._user_path}/calendar/events/{event.id}"
 
             resp = requests.patch(url, headers=self._headers(), json=self._to_graph_format(event))
             resp.raise_for_status()
@@ -192,9 +209,9 @@ class M365CalendarWriter(CalendarWriter):
     ) -> None:
         try:
             if calendar_id:
-                url = f"{GRAPH_BASE}/me/calendars/{calendar_id}/events/{event_id}"
+                url = f"{GRAPH_BASE}/{self._user_path}/calendars/{calendar_id}/events/{event_id}"
             else:
-                url = f"{GRAPH_BASE}/me/calendar/events/{event_id}"
+                url = f"{GRAPH_BASE}/{self._user_path}/calendar/events/{event_id}"
 
             resp = requests.delete(url, headers=self._headers())
             resp.raise_for_status()

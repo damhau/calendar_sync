@@ -18,6 +18,8 @@ class M365Config(BaseSettings):
     client_id: Optional[str] = Field(None, validation_alias="M365_CLIENT_ID")
     client_secret: Optional[str] = Field(None, validation_alias="M365_CLIENT_SECRET")
     authority: Optional[str] = Field(None, validation_alias="M365_AUTHORITY")
+    # Primary email - required for client credentials flow (app-only)
+    primary_email: Optional[str] = Field(None, validation_alias="M365_PRIMARY_EMAIL")
     # Scopes are hardcoded - no need to configure
     scopes: list[str] = Field(default=["Calendars.Read", "Calendars.ReadWrite"])
 
@@ -107,6 +109,35 @@ class AccountConfig:
         # Use browser for API calls (required for Office 365 OWA without Graph API access)
         # When true, the browser stays open and API calls are made via JavaScript
         self.use_browser_api: bool = data.get("use_browser_api", False)
+
+        # Day filtering - exclude events on certain days of the week
+        # Format: list of day abbreviations: Mon, Tue, Wed, Thu, Fri, Sat, Sun
+        exclude_days_raw = data.get("exclude_days", [])
+        self.exclude_days: set[int] = self._parse_days(exclude_days_raw)
+
+        # Include only events on certain days (if specified, only these days are synced)
+        include_days_raw = data.get("include_days", [])
+        self.include_days: set[int] = self._parse_days(include_days_raw)
+
+    @staticmethod
+    def _parse_days(days: list) -> set[int]:
+        """Parse day names to weekday numbers (0=Monday, 6=Sunday)."""
+        day_map = {
+            "mon": 0, "monday": 0,
+            "tue": 1, "tuesday": 1,
+            "wed": 2, "wednesday": 2,
+            "thu": 3, "thursday": 3,
+            "fri": 4, "friday": 4,
+            "sat": 5, "saturday": 5,
+            "sun": 6, "sunday": 6,
+        }
+        result = set()
+        for day in days:
+            if isinstance(day, str):
+                day_lower = day.lower().strip()
+                if day_lower in day_map:
+                    result.add(day_map[day_lower])
+        return result
 
 
 class SyncConfig:

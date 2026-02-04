@@ -36,8 +36,11 @@ def get_sync_window(
         Tuple of (start_date, end_date) in UTC
     """
     now = datetime.now(pytz.utc)
-    start = now - timedelta(days=lookback_days)
-    end = now + timedelta(days=lookahead_days)
+    # Use start of day (midnight UTC) to include all events from that day
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = today_midnight - timedelta(days=lookback_days)
+    # End at midnight of the last day to include all events
+    end = today_midnight + timedelta(days=lookahead_days + 1)
     return start, end
 
 
