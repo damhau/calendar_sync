@@ -102,6 +102,12 @@ class SeleniumEWSAuth:
             logger.error(f"Failed to save cookies: {e}")
             raise AuthenticationError(f"Failed to save cookies: {e}") from e
 
+    def delete_cookie_cache(self) -> None:
+        """Delete the cached cookie file so the next call fetches fresh cookies."""
+        if self.cookie_file.exists():
+            self.cookie_file.unlink()
+            logger.info(f"Deleted cookie cache: {self.cookie_file}")
+
     def fetch_cookies_from_browser(self) -> dict[str, str]:
         """
         Open browser and wait for user to login, then extract cookies.

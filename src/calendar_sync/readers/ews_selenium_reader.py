@@ -1,5 +1,6 @@
 """Exchange calendar reader using OWA REST API with Selenium-based cookie authentication."""
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -820,7 +821,19 @@ class EWSSeleniumReader(CalendarReader):
                 f"OWA {action} failed with status {resp.status_code}: {resp.text[:500]}"
             )
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            logger.warning(
+                "OWA returned invalid JSON (likely expired cookies), "
+                "deleting cookie cache and refreshing..."
+            )
+            self.selenium_auth.delete_cookie_cache()
+            self._session = None
+            self.selenium_auth.get_cookies(force_refresh=True)
+            session = self._get_session()
+            resp = session.post(url, json=payload, headers=action_headers, timeout=30)
+            data = resp.json()
         resp_body = data.get("Body", {})
         messages = resp_body.get("ResponseMessages", {}).get("Items", [])
 
