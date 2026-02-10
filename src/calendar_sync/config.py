@@ -110,6 +110,10 @@ class AccountConfig:
         # When true, the browser stays open and API calls are made via JavaScript
         self.use_browser_api: bool = data.get("use_browser_api", False)
 
+        # Run browser in headless mode (hidden, no UI)
+        # Useful when SSO works automatically and no user interaction is needed
+        self.headless: bool = data.get("headless", False)
+
         # Day filtering - exclude events on certain days of the week
         # Format: list of day abbreviations: Mon, Tue, Wed, Thu, Fri, Sat, Sun
         exclude_days_raw = data.get("exclude_days", [])

@@ -30,6 +30,7 @@ class SeleniumEWSAuth:
         required_cookies: Optional[list[str]] = None,
         browser: str = "chrome",
         use_browser_api: bool = False,
+        headless: bool = False,
     ):
         """
         Initialize Selenium-based EWS authentication.
@@ -40,12 +41,14 @@ class SeleniumEWSAuth:
             required_cookies: List of required cookie names (e.g., ['MRHSession', 'FedAuth'])
             browser: Browser to use ('chrome' or 'edge')
             use_browser_api: If True, keep browser open for API calls instead of using cookies
+            headless: If True, run browser in headless mode (no visible UI)
         """
         self.base_url = base_url.rstrip("/")
         self.cookie_file = cookie_file
         self.required_cookies = required_cookies or ["MRHSession"]
         self.browser = browser.lower()
         self.use_browser_api = use_browser_api
+        self.headless = headless
         self._cookies: Optional[dict[str, str]] = None
         self._driver: Optional[webdriver.Chrome] = None  # Keep browser instance
 
@@ -110,7 +113,8 @@ class SeleniumEWSAuth:
             AuthenticationError: If browser automation fails or cookies not found
         """
         browser_name = self.browser.capitalize()
-        print(f"🌐 Opening {browser_name} to let you log in...")
+        headless_msg = " (headless)" if self.headless else ""
+        print(f"🌐 Opening {browser_name}{headless_msg} to let you log in...")
 
         # Create browser-specific options and driver
         if self.browser == "edge":
@@ -123,6 +127,9 @@ class SeleniumEWSAuth:
                 options.add_argument("--disable-blink-features=AutomationControlled")
                 options.add_argument("--no-sandbox")
                 options.add_argument("--disable-dev-shm-usage")
+                if self.headless:
+                    options.add_argument("--headless=new")
+                    options.add_argument("--window-size=1920,1080")
                 driver = webdriver.Edge(options=options)
             except ImportError:
                 raise AuthenticationError(
@@ -137,6 +144,9 @@ class SeleniumEWSAuth:
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--remote-debugging-port=9222")
+            if self.headless:
+                options.add_argument("--headless=new")
+                options.add_argument("--window-size=1920,1080")
             driver = webdriver.Chrome(options=options)
         # options = Options()
         # options.add_experimental_option("detach", False)
@@ -511,20 +521,24 @@ class SeleniumEWSAuth:
     def _launch_browser_for_api(self, cookies: dict[str, str]) -> None:
         """
         Launch browser with existing cookies for making API calls.
-        
+
         This is used when use_browser_api is enabled and we have cached cookies
         but no canary token (Office 365 scenario).
         """
         from selenium.webdriver.chrome.options import Options as ChromeOptions
-        
-        print("🌐 Launching browser for API calls...")
-        
+
+        headless_msg = " (headless)" if self.headless else ""
+        print(f"🌐 Launching browser{headless_msg} for API calls...")
+
         if self.browser == "edge":
             try:
                 from selenium.webdriver.edge.options import Options
                 options = Options()
                 options.add_experimental_option("detach", False)
                 options.add_argument("--disable-blink-features=AutomationControlled")
+                if self.headless:
+                    options.add_argument("--headless=new")
+                    options.add_argument("--window-size=1920,1080")
                 driver = webdriver.Edge(options=options)
             except ImportError:
                 raise AuthenticationError("Edge WebDriver not available")
@@ -532,6 +546,9 @@ class SeleniumEWSAuth:
             options = ChromeOptions()
             options.add_experimental_option("detach", False)
             options.add_argument("--disable-blink-features=AutomationControlled")
+            if self.headless:
+                options.add_argument("--headless=new")
+                options.add_argument("--window-size=1920,1080")
             driver = webdriver.Chrome(options=options)
         
         try:
@@ -560,7 +577,7 @@ class SeleniumEWSAuth:
             if "login.microsoftonline" in driver.current_url:
                 print("🔐 Please complete authentication in the browser...")
                 # Wait for authentication to complete
-                max_wait = 300
+                max_wait = 600
                 start_time = time.time()
                 while "login.microsoftonline" in driver.current_url:
                     if time.time() - start_time > max_wait:
@@ -569,7 +586,12 @@ class SeleniumEWSAuth:
                     time.sleep(2)
             
             print("⏳ Waiting for calendar to load...")
-            time.sleep(5)
+            max_wait = 300
+            start_time = time.time()
+            while "outlook.office.com" not in driver.current_url:
+                if time.time() - start_time > max_wait:
+                    raise AuthenticationError("Authentication timeout")
+                time.sleep(2)
             
             # Store the driver for API calls
             self._driver = driver
@@ -648,9 +670,10 @@ class SeleniumEWSAuth:
             driver = self._driver
             need_to_close = False
         else:
-            print("🌐 Opening new browser to fetch calendar events...")
+            headless_msg = " (headless)" if self.headless else ""
+            print(f"🌐 Opening new browser{headless_msg} to fetch calendar events...")
             need_to_close = True
-            
+
             # Create browser
             if self.browser == "edge":
                 try:
@@ -658,6 +681,9 @@ class SeleniumEWSAuth:
                     options = Options()
                     options.add_experimental_option("detach", False)
                     options.add_argument("--disable-blink-features=AutomationControlled")
+                    if self.headless:
+                        options.add_argument("--headless=new")
+                        options.add_argument("--window-size=1920,1080")
                     driver = webdriver.Edge(options=options)
                 except ImportError:
                     raise AuthenticationError("Edge WebDriver not available")
@@ -665,6 +691,9 @@ class SeleniumEWSAuth:
                 options = ChromeOptions()
                 options.add_experimental_option("detach", False)
                 options.add_argument("--disable-blink-features=AutomationControlled")
+                if self.headless:
+                    options.add_argument("--headless=new")
+                    options.add_argument("--window-size=1920,1080")
                 driver = webdriver.Chrome(options=options)
         
         try:
@@ -684,7 +713,7 @@ class SeleniumEWSAuth:
             if "login.microsoftonline" in driver.current_url:
                 print("🔐 Please complete authentication in the browser...")
                 # Wait for authentication to complete
-                max_wait = 300
+                max_wait = 600
                 start_time = time.time()
                 while "login.microsoftonline" in driver.current_url:
                     if time.time() - start_time > max_wait:
@@ -696,8 +725,17 @@ class SeleniumEWSAuth:
             
             # Wait for calendar page to be ready
             print("⏳ Waiting for calendar to load...")
-            time.sleep(5)
+        
+            max_wait = 300
+            start_time = time.time()
+            while "outlook.office.com" not in driver.current_url:
+                if time.time() - start_time > max_wait:
+                    raise AuthenticationError("Authentication timeout")
+                time.sleep(2)
             
+
+
+
             # Make the API call from within the browser using fetch
             print("📅 Fetching calendar events...")
             result = driver.execute_script(f"""
@@ -927,45 +965,43 @@ class SeleniumEWSAuth:
                 else:
                     print(f"📅 OWA API returned 0 events (endpoint: {endpoint}, hasCanary: {has_canary})")
             
-            # Method 3: Extract events from DOM (most reliable for Office 365)
-            print("⏳ Extracting events from calendar DOM...")
-            dom_events = driver.execute_script("""
+            # Method 3: Extract events from DOM.
+            # Switch to month view so all events in the date range are visible.
+            print("⏳ Switching to month view...")
+            try:
+                driver.get(f"{self.base_url}/calendar/view/month")
+                time.sleep(3)
+                logger.info("Switched to Month view for broader event extraction")
+            except Exception as e:
+                logger.warning(f"Failed to switch to Month view: {e}")
+
+            # JavaScript to extract events from the current calendar view
+            extract_dom_js = """
                 let events = [];
                 try {
-                    // Look for calendar event elements with aria-labels
-                    // Format: "Subject, HH:MM to HH:MM, Day, Month DD, YYYY, ..."
                     const selectors = [
                         '[role="button"][aria-label*="event"]',
                         '[role="button"][aria-label*=", "][aria-label*=" to "]',
                         '[data-automation-id="CalendarEventCard"]',
                         '.ms-CalendarEvent'
                     ];
-                    
                     let foundElements = new Set();
-                    
                     for (const selector of selectors) {
                         const elements = document.querySelectorAll(selector);
                         for (const el of elements) {
                             const label = el.getAttribute('aria-label');
                             if (label && label.length > 10 && label.includes(' to ')) {
-                                // Avoid duplicates
                                 if (foundElements.has(label)) continue;
                                 foundElements.add(label);
-                                
-                                // Parse the aria-label
-                                // Format: "Subject, HH:MM to HH:MM, DayName, Month DD, YYYY, [By Organizer], [Status], [Recurring event]"
                                 const parts = label.split(', ');
                                 if (parts.length >= 4) {
                                     const subject = parts[0];
-                                    const timeRange = parts[1]; // "09:00 to 12:00"
-                                    
-                                    // Find date parts (look for day name)
+                                    const timeRange = parts[1];
                                     let dayName = '';
                                     let monthDay = '';
                                     let year = '';
                                     let organizer = '';
                                     let isRecurring = label.includes('Recurring event');
-                                    
                                     for (let i = 2; i < parts.length; i++) {
                                         const part = parts[i].trim();
                                         if (['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].some(d => part.startsWith(d))) {
@@ -978,12 +1014,8 @@ class SeleniumEWSAuth:
                                             organizer = part.substring(3);
                                         }
                                     }
-                                    
-                                    // Parse time range - handle both 24h and 12h AM/PM formats
                                     let startTime = '';
                                     let endTime = '';
-
-                                    // Helper to convert 12h to 24h format
                                     function to24h(time, period) {
                                         if (!time) return '';
                                         let [h, m] = time.split(':').map(Number);
@@ -991,28 +1023,22 @@ class SeleniumEWSAuth:
                                         if (period && period.toUpperCase() === 'AM' && h === 12) h = 0;
                                         return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
                                     }
-
-                                    // Try 12-hour format with AM/PM: "1:30 PM to 3:30 PM" or "1:30 PM to 3:30"
                                     const timeMatch12 = timeRange.match(/(\\d{1,2}:\\d{2})\\s*(AM|PM)?\\s+to\\s+(\\d{1,2}:\\d{2})\\s*(AM|PM)?/i);
                                     if (timeMatch12) {
-                                        let startPeriod = timeMatch12[2] || timeMatch12[4] || 'PM'; // Default to PM if not specified
-                                        let endPeriod = timeMatch12[4] || startPeriod; // End period defaults to start period
+                                        let startPeriod = timeMatch12[2] || timeMatch12[4] || 'PM';
+                                        let endPeriod = timeMatch12[4] || startPeriod;
                                         startTime = to24h(timeMatch12[1], startPeriod);
                                         endTime = to24h(timeMatch12[3], endPeriod);
                                     } else {
-                                        // Try 24-hour format: "09:00 to 12:00"
                                         const timeMatch24 = timeRange.match(/(\\d{1,2}:\\d{2})\\s+to\\s+(\\d{1,2}:\\d{2})/);
                                         if (timeMatch24) {
                                             startTime = timeMatch24[1].padStart(5, '0');
                                             endTime = timeMatch24[2].padStart(5, '0');
                                         }
                                     }
-                                    
-                                    // Build ISO date strings - avoid timezone issues by parsing manually
                                     let startDate = null;
                                     let endDate = null;
                                     if (monthDay && year) {
-                                        // Parse month and day directly to avoid timezone conversion issues
                                         const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
                                                            'July', 'August', 'September', 'October', 'November', 'December'];
                                         const monthMatch = monthDay.match(/([A-Za-z]+)\\s+(\\d+)/);
@@ -1026,7 +1052,6 @@ class SeleniumEWSAuth:
                                             }
                                         }
                                     }
-                                    
                                     events.push({
                                         Subject: subject,
                                         Start: startDate ? {DateTime: startDate, TimeZone: 'UTC'} : null,
@@ -1044,17 +1069,15 @@ class SeleniumEWSAuth:
                     console.error('DOM extraction error:', e);
                 }
                 return JSON.stringify(events);
-            """)
-            
+            """
+
+            print("⏳ Extracting events from calendar DOM...")
+            dom_events = driver.execute_script(extract_dom_js)
+
             if dom_events:
                 dom_parsed = json.loads(dom_events)
                 if len(dom_parsed) > 0:
-                    # print(f"✅ Extracted {len(dom_parsed)} events from calendar DOM")
-                    # Debug: show all events
-                    for i, ev in enumerate(dom_parsed):
-                        start = ev.get('Start')
-                        start_dt = start.get('DateTime') if start else 'None'
-                        # print(f"  [{i+1}] {ev.get('Subject', '?')[:50]} | Start: {start_dt} | Raw: {ev.get('_rawLabel', '')[:80]}...")
+                    logger.info(f"Extracted {len(dom_parsed)} events from calendar DOM (month view)")
                     if need_to_close:
                         driver.quit()
                     return dom_parsed

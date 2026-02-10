@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(findstr:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(uv run:*)",
+      "Bash(set:*)",
+      "Bash(chcp:*)",
+      "Bash(PYTHONIOENCODING=utf-8 uv run:*)"
     ]
   }
 }

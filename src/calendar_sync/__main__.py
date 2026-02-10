@@ -32,6 +32,7 @@ def _create_reader(account, cache_manager):
             required_cookies=account.required_cookies,
             browser=account.browser,
             use_browser_api=account.use_browser_api,
+            headless=account.headless,
         )
         # Build a minimal EWSConfig-like object from account
         from .config import EWSConfig
@@ -366,6 +367,25 @@ def main() -> int:
             # Fetch existing events for dedup
             existing = target_writer.get_existing_events(start, end)
 
+            # Collect source event keys and prefixes for orphan detection
+            source_keys = set()
+            for event in all_events:
+                key = (event.subject, event.start.strftime("%Y-%m-%dT%H:%M"))
+                source_keys.add(key)
+
+            source_prefixes = []
+            for name in source_names:
+                account = sync_config.accounts[name]
+                if account.prefix:
+                    source_prefixes.append(account.prefix)
+
+            # Find orphans: target events with a source prefix that no longer exist in source
+            orphans = {}
+            for key, event_id in existing.items():
+                subject = key[0]
+                if any(subject.startswith(p) for p in source_prefixes) and key not in source_keys:
+                    orphans[key] = event_id
+
             if args.dry_run:
                 skipped = 0
                 would_create = []
@@ -377,15 +397,20 @@ def main() -> int:
                         would_create.append(event)
                 print(f"\nDry run - {target_name}:")
                 print(f"  Would create: {len(would_create)}")
+                print(f"  Would delete (orphan): {len(orphans)}")
                 print(f"  Already exist (skip): {skipped}")
                 for event in would_create:
                     print(f"  + {event.subject}")
                     print(f"    When: {event.start} to {event.end}")
+                for key in orphans:
+                    print(f"  - {key[0]}")
+                    print(f"    When: {key[1]}")
                 return 0
 
             # Write events, skipping duplicates
             created = 0
             skipped = 0
+            deleted = 0
             errors = []
             for event in all_events:
                 key = (event.subject, event.start.strftime("%Y-%m-%dT%H:%M"))
@@ -400,9 +425,21 @@ def main() -> int:
                     logger.error(error_msg)
                     errors.append(error_msg)
 
+            # Delete orphan events
+            for key, event_id in orphans.items():
+                try:
+                    target_writer.delete_event(event_id)
+                    deleted += 1
+                    logger.info(f"Deleted orphan: {key[0]} ({key[1]})")
+                except Exception as e:
+                    error_msg = f"Failed to delete orphan '{key[0]}': {e}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+
             print(f"\nSync Results:")
             print(f"  Events read: {len(all_events)}")
             print(f"  Events created: {created}")
+            print(f"  Events deleted (orphan): {deleted}")
             print(f"  Events skipped (already exist): {skipped}")
             if errors:
                 print(f"\nErrors ({len(errors)}):")

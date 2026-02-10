@@ -56,7 +56,7 @@ class M365CalendarReader(CalendarReader):
             return self.client.users[self.primary_email]
         else:
             # Delegated auth: use /me
-            return self._user_endpoint
+            return self.client.me
 
     def list_calendars(self) -> list[Calendar]:
         """List all calendars for the authenticated user."""
