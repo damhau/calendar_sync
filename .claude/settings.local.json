@@ -6,7 +6,9 @@
       "Bash(uv run:*)",
       "Bash(set:*)",
       "Bash(chcp:*)",
-      "Bash(PYTHONIOENCODING=utf-8 uv run:*)"
+      "Bash(PYTHONIOENCODING=utf-8 uv run:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }
