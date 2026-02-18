@@ -971,15 +971,18 @@ class SeleniumEWSAuth:
                 else:
                     print(f"📅 OWA API returned 0 events (endpoint: {endpoint}, hasCanary: {has_canary})")
             
-            # Method 3: Extract events from DOM.
-            # Switch to month view so all events in the date range are visible.
-            print("⏳ Switching to month view...")
+            # Method 3: Extract events from DOM using week view.
+            # Week view shows all events per day without the truncation
+            # that month view suffers from (month view silently hides overflow).
+            from datetime import datetime as _dt, timedelta as _td
+
+            print("⏳ Switching to week view...")
             try:
-                driver.get(f"{self.base_url}/calendar/view/month")
+                driver.get(f"{self.base_url}/calendar/view/week")
                 time.sleep(3)
-                logger.info("Switched to Month view for broader event extraction")
+                logger.info("Switched to week view for DOM extraction")
             except Exception as e:
-                logger.warning(f"Failed to switch to Month view: {e}")
+                logger.warning(f"Failed to switch to week view: {e}")
 
             # JavaScript to extract events from the current calendar view
             extract_dom_js = """
@@ -1077,16 +1080,78 @@ class SeleniumEWSAuth:
                 return JSON.stringify(events);
             """
 
-            print("⏳ Extracting events from calendar DOM...")
-            dom_events = driver.execute_script(extract_dom_js)
+            # Calculate how many weeks to navigate forward
+            try:
+                start_dt = _dt.strptime(start_date[:10], "%Y-%m-%d")
+                end_dt = _dt.strptime(end_date[:10], "%Y-%m-%d")
+            except (ValueError, TypeError):
+                start_dt = _dt.now()
+                end_dt = start_dt + _td(days=15)
 
+            now = _dt.now()
+            current_week_end = now + _td(days=(6 - now.weekday()))  # Sunday of current week
+            weeks_forward = 0
+            while current_week_end < end_dt:
+                weeks_forward += 1
+                current_week_end += _td(days=7)
+
+            total_weeks = 1 + weeks_forward
+            all_dom_events = []
+            seen_labels = set()
+
+            print(f"⏳ Extracting events from {total_weeks} week view(s)...")
+
+            # Extract current week
+            dom_events = driver.execute_script(extract_dom_js)
             if dom_events:
-                dom_parsed = json.loads(dom_events)
-                if len(dom_parsed) > 0:
-                    logger.info(f"Extracted {len(dom_parsed)} events from calendar DOM (month view)")
-                    if need_to_close:
-                        driver.quit()
-                    return dom_parsed
+                week_parsed = json.loads(dom_events)
+                for event in week_parsed:
+                    raw = event.get("_rawLabel", "")
+                    if raw not in seen_labels:
+                        seen_labels.add(raw)
+                        all_dom_events.append(event)
+                logger.info(f"  Week 1/{total_weeks} (current): {len(all_dom_events)} events")
+
+            # Click forward through remaining weeks
+            for w in range(weeks_forward):
+                try:
+                    # Find the "Go to next week" button in the main calendar view
+                    next_btn = None
+                    try:
+                        next_btn = driver.find_element("css selector", 'button[aria-label*="next week" i]')
+                    except Exception:
+                        pass
+
+                    if not next_btn:
+                        logger.warning(f"  Week {w+2}/{total_weeks}: could not find next-week button")
+                        break
+
+                    next_btn.click()
+                    time.sleep(4)
+
+                    dom_events = driver.execute_script(extract_dom_js)
+                    if dom_events:
+                        week_parsed = json.loads(dom_events)
+                        added = 0
+                        for event in week_parsed:
+                            raw = event.get("_rawLabel", "")
+                            if raw not in seen_labels:
+                                seen_labels.add(raw)
+                                all_dom_events.append(event)
+                                added += 1
+                        logger.info(f"  Week {w+2}/{total_weeks}: {added} new events ({len(week_parsed)} total, {len(week_parsed) - added} duplicates)")
+                    else:
+                        logger.info(f"  Week {w+2}/{total_weeks}: no events found")
+                except Exception as e:
+                    logger.warning(f"  Week {w+2}/{total_weeks}: navigation failed: {e}")
+
+            if len(all_dom_events) > 0:
+                logger.info(f"Total DOM events extracted across all weeks: {len(all_dom_events)}")
+                if need_to_close:
+                    driver.quit()
+                for event in all_dom_events:
+                    logger.debug(f"  {event['Subject']} @ {event['Start']['DateTime'] if event.get('Start') else '?'}")
+                return all_dom_events
             
             # Only close browser if we opened it ourselves (not in use_browser_api mode)
             if need_to_close:

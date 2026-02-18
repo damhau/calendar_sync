@@ -387,24 +387,61 @@ def main() -> int:
                     orphans[key] = event_id
 
             if args.dry_run:
-                skipped = 0
+                skip_events = []
                 would_create = []
                 for event in all_events:
                     key = (event.subject, event.start.strftime("%Y-%m-%dT%H:%M"))
                     if key in existing:
-                        skipped += 1
+                        skip_events.append(event)
                     else:
                         would_create.append(event)
-                print(f"\nDry run - {target_name}:")
-                print(f"  Would create: {len(would_create)}")
-                print(f"  Would delete (orphan): {len(orphans)}")
-                print(f"  Already exist (skip): {skipped}")
+
+                # Build unified row list: (sort_key, action, date, time, subject)
+                rows = []
                 for event in would_create:
-                    print(f"  + {event.subject}")
-                    print(f"    When: {event.start} to {event.end}")
+                    date_str = event.start.strftime("%Y-%m-%d")
+                    time_str = f"{event.start.strftime('%H:%M')} - {event.end.strftime('%H:%M')}"
+                    sort_key = event.start.strftime("%Y-%m-%dT%H:%M")
+                    rows.append((sort_key, "+", date_str, time_str, event.subject))
                 for key in orphans:
-                    print(f"  - {key[0]}")
-                    print(f"    When: {key[1]}")
+                    subject, start_str = key
+                    try:
+                        dt = datetime.strptime(start_str, "%Y-%m-%dT%H:%M")
+                        date_str = dt.strftime("%Y-%m-%d")
+                        time_str = dt.strftime("%H:%M")
+                        sort_key = start_str
+                    except (ValueError, TypeError):
+                        date_str = start_str[:10] if len(start_str) >= 10 else start_str
+                        time_str = start_str[11:16] if len(start_str) >= 16 else ""
+                        sort_key = start_str
+                    rows.append((sort_key, "-", date_str, time_str, subject))
+                for event in skip_events:
+                    date_str = event.start.strftime("%Y-%m-%d")
+                    time_str = f"{event.start.strftime('%H:%M')} - {event.end.strftime('%H:%M')}"
+                    sort_key = event.start.strftime("%Y-%m-%dT%H:%M")
+                    rows.append((sort_key, "=", date_str, time_str, event.subject))
+
+                rows.sort(key=lambda r: r[0])
+
+                # Compute column widths
+                headers = ("Action", "Date", "Time", "Subject")
+                col_w = [len(h) for h in headers]
+                for _, action, date_str, time_str, subject in rows:
+                    col_w[0] = max(col_w[0], len(action))
+                    col_w[1] = max(col_w[1], len(date_str))
+                    col_w[2] = max(col_w[2], len(time_str))
+                    col_w[3] = max(col_w[3], len(subject))
+
+                def fmt_row(vals):
+                    return "  " + " | ".join(v.ljust(col_w[i]) for i, v in enumerate(vals))
+
+                print(f"\nDry run - {target_name} ({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}):")
+                print(f"  Would create: {len(would_create)} | Would delete (orphan): {len(orphans)} | Already exist (skip): {len(skip_events)}")
+                print()
+                print(fmt_row(headers))
+                print("  " + "-|-".join("-" * col_w[i] for i in range(4)))
+                for _, action, date_str, time_str, subject in rows:
+                    print(fmt_row((action, date_str, time_str, subject)))
                 return 0
 
             # Write events, skipping duplicates
